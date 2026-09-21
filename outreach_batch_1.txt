@@ -1,0 +1,71 @@
+# Garcar Emergency Outreach — Batch 1 (DFW / Johnson County Real-Estate Team Leads)
+# Goal: Force first paid events into the live $497 / $2,500 Stripe links
+# Send from: gwc2780@gmail.com or garrett@garcar.io
+# After any “start” or “yes” → reply with the live link same hour
+
+---
+
+TEMPLATE A (short, high-response)
+
+Subject: Who calls the lead when the agent is in a showing?
+
+Hey [First],
+
+Garrett in Grandview / Johnson County.
+
+When a new Zillow or website lead hits and the agent who owns it is already in a showing, who actually calls that person back?
+
+Most teams have no named backup and no timer. The lead goes cold while everyone assumes someone else handled it.
+
+I do a $497 review of one recent list (last 30 days, one source). You get:
+- marked spreadsheet
+- one-page count
+- written rules you can use the same day
+
+No new CRM. No promised deals. Just visibility on the ones you already paid for.
+
+If you want it: https://buy.stripe.com/8x2eVddjf0hQ86Tf0f43S2h
+Or reply “497” and I’ll send the link.
+
+Garrett
+
+---
+
+TEMPLATE B (slightly longer, for warmer names)
+
+Subject: Backup person + timer for your existing leads
+
+[First] —
+
+Quick one from Grandview.
+
+You already get leads. The gap is usually the hour after they arrive while the assigned agent is in a showing or on another call.
+
+I put a simple timer and named backup into the system you already use (Follow Up Boss or whatever you run). 
+
+$497 reviews one recent list and gives you the rules. $2,500 installs the timer + backup.
+
+No new monthly software. No AI pitch. Just “who calls this lead if the first person can’t.”
+
+Start the review: https://buy.stripe.com/8x2eVddjf0hQ86Tf0f43S2h
+Or reply and I’ll send it.
+
+Garrett Carrol
+garrett@garcar.io
+
+---
+
+TEMPLATE C (ultra-short SMS / LinkedIn)
+
+[First] — Garrett in Johnson County. Who calls the new lead when the agent is already in a showing? Most teams have no named backup. $497 review of one recent list if you want the map: buy.stripe.com/8x2eVddjf0hQ86Tf0f43S2h
+
+---
+
+SEND ORDER (do today)
+1. Pull 40–60 DFW / Johnson County team-lead names you already have or can reach.
+2. Personalize [First] only. Do not rewrite the body.
+3. Send 15–20 from email, 15–20 from LinkedIn, rest SMS if you have numbers.
+4. Every positive reply → same-hour Stripe link + calendar hold for the 48 h fulfillment window.
+5. Log every send + every reply in a simple sheet so we can see conversion.
+
+After the first paid event lands, the emergency webhook will fire and the clock starts.
