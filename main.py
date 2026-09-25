@@ -1,142 +1,287 @@
-"""
-Garcar Emergency Payments — zero-dependency Stripe webhook + fulfillment receiver.
-Bypasses locked Cloudflare Workers + Vercel entirely.
-Deploy to any free host (Railway, Render, Fly, even a $5 VPS).
-"""
+"""Garcar Stripe webhook receiver with verified, idempotent payment intake."""
 
-import os
-import json
-import hmac
 import hashlib
+import hmac
+import json
+import os
+import sqlite3
 import time
 from datetime import datetime, timezone
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
-# Optional: only import stripe if key is present (keeps cold-start tiny)
-try:
-    import stripe
-except ImportError:
-    stripe = None
-
-PORT = int(os.environ.get("PORT", 8080))
+PORT = int(os.environ.get("PORT", "8080"))
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
-STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
-FULFILLMENT_EMAIL = os.environ.get("FULFILLMENT_EMAIL", "gwc2780@gmail.com")
-LOG_FILE = os.environ.get("LOG_FILE", "/tmp/garcar_payments.log")
+ALLOW_UNVERIFIED_WEBHOOKS = os.environ.get("ALLOW_UNVERIFIED_WEBHOOKS", "false").lower() == "true"
+FULFILLMENT_WEBHOOK_URL = os.environ.get("FULFILLMENT_WEBHOOK_URL", "")
+FULFILLMENT_WEBHOOK_TOKEN = os.environ.get("FULFILLMENT_WEBHOOK_TOKEN", "")
+DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
+DB_PATH = Path(os.environ.get("DB_PATH", str(DATA_DIR / "garcar_payments.sqlite3")))
+SIGNATURE_TOLERANCE_SECONDS = int(os.environ.get("STRIPE_SIGNATURE_TOLERANCE_SECONDS", "300"))
 
-# Live offer map (from storefront)
-OFFERS = {
-    "price_497": {"name": "$497 Lead List Review", "sku": "497-review", "fulfill_hours": 48},
-    "price_2500": {"name": "$2,500 Install", "sku": "2500-install", "fulfill_hours": 72},
-    # Fallback for orphan $47 link
-    "price_47": {"name": "$47 Contractor Audit (orphan)", "sku": "47-audit", "fulfill_hours": 48},
+OFFER_BY_AMOUNT = {
+    4700: {"name": "$47 Contractor Lead Leak Audit", "sku": "contractor-audit-47", "fulfill_hours": 48},
+    250000: {"name": "$2,500 CRM Safeguard", "sku": "crm-safeguard-2500", "fulfill_hours": 72},
+}
+FULFILLABLE_EVENTS = {
+    "checkout.session.completed",
+    "checkout.session.async_payment_succeeded",
+    "invoice.paid",
 }
 
 
-def log(msg: str):
-    ts = datetime.now(timezone.utc).isoformat()
-    line = f"[{ts}] {msg}\n"
-    print(line, end="", flush=True)
-    try:
-        with open(LOG_FILE, "a") as f:
-            f.write(line)
-    except Exception:
-        pass
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def verify_stripe_signature(payload: bytes, sig_header: str, secret: str) -> bool:
-    """Minimal Stripe signature verification (no SDK required)."""
-    if not secret or not sig_header:
+def log(message: str) -> None:
+    print(f"[{utc_now()}] {message}", flush=True)
+
+
+def _connect() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(DB_PATH, timeout=10)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA foreign_keys=ON")
+    return connection
+
+
+def init_db() -> None:
+    with _connect() as connection:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS stripe_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                payload_sha256 TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS payments (
+                payment_reference TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                customer_email TEXT,
+                amount_minor INTEGER NOT NULL,
+                currency TEXT NOT NULL,
+                offer_name TEXT NOT NULL,
+                sku TEXT NOT NULL,
+                fulfill_hours INTEGER NOT NULL,
+                session_id TEXT,
+                recurring INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                FOREIGN KEY(event_id) REFERENCES stripe_events(event_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_payments_created_at ON payments(created_at);
+            """
+        )
+
+
+def verify_stripe_signature(payload: bytes, signature_header: str, secret: str, now: int | None = None) -> bool:
+    if not secret or not signature_header:
+        return False
+    timestamp = None
+    signatures = []
+    for part in signature_header.split(","):
+        key, separator, value = part.partition("=")
+        if not separator:
+            continue
+        if key == "t":
+            timestamp = value
+        elif key == "v1":
+            signatures.append(value)
+    if not timestamp or not signatures:
         return False
     try:
-        elements = dict(item.split("=", 1) for item in sig_header.split(","))
-        timestamp = elements.get("t")
-        signature = elements.get("v1")
-        if not timestamp or not signature:
-            return False
-        # Reject if older than 5 minutes
-        if abs(time.time() - int(timestamp)) > 300:
-            return False
-        signed_payload = f"{timestamp}.{payload.decode('utf-8')}"
-        expected = hmac.new(
-            secret.encode("utf-8"),
-            signed_payload.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-        return hmac.compare_digest(expected, signature)
-    except Exception as e:
-        log(f"Signature verify error: {e}")
+        signed_at = int(timestamp)
+    except ValueError:
         return False
+    current_time = int(time.time()) if now is None else now
+    if abs(current_time - signed_at) > SIGNATURE_TOLERANCE_SECONDS:
+        return False
+    signed_payload = f"{timestamp}.".encode() + payload
+    expected = hmac.new(secret.encode(), signed_payload, hashlib.sha256).hexdigest()
+    return any(hmac.compare_digest(expected, candidate) for candidate in signatures)
 
 
-def extract_offer(session: dict) -> dict:
-    """Map Stripe session / line items to a known offer."""
-    amount = session.get("amount_total") or 0
-    if amount == 49700:
-        return OFFERS["price_497"]
-    if amount == 250000:
-        return OFFERS["price_2500"]
-    if amount == 4700:
-        return OFFERS["price_47"]
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _metadata(obj: dict) -> dict:
+    raw = obj.get("metadata") or {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def resolve_offer(obj: dict, amount_minor: int) -> dict:
+    metadata = _metadata(obj)
+    sku = str(metadata.get("sku") or metadata.get("offer_id") or "").strip()
+    name = str(metadata.get("offer_name") or metadata.get("product_name") or "").strip()
+    hours = _safe_int(metadata.get("fulfill_hours"), 0)
+    if sku or name:
+        return {
+            "sku": sku or "metadata-offer",
+            "name": name or sku,
+            "fulfill_hours": hours if 1 <= hours <= 720 else 48,
+        }
+    if amount_minor in OFFER_BY_AMOUNT:
+        return OFFER_BY_AMOUNT[amount_minor]
+    if amount_minor == 49700:
+        return {
+            "name": "$497 purchase — verify source link before fulfillment",
+            "sku": "manual-review-497",
+            "fulfill_hours": 48,
+        }
     return {
-        "name": f"Unknown (${amount/100:.2f})",
-        "sku": "unknown",
+        "name": f"Unmapped payment ({amount_minor} minor units)",
+        "sku": "manual-review-unmapped",
         "fulfill_hours": 48,
     }
 
 
-def fulfill(event_type: str, data: dict):
-    """Core fulfillment: log + prepare human hand-off."""
-    session = data.get("object", {})
-    customer_email = (
-        session.get("customer_details", {}).get("email")
-        or session.get("customer_email")
-        or "unknown"
-    )
-    offer = extract_offer(session)
-    payment_intent = session.get("payment_intent") or session.get("id")
-    amount = (session.get("amount_total") or 0) / 100
+def extract_payment(event: dict) -> dict | None:
+    event_id = str(event.get("id") or "").strip()
+    event_type = str(event.get("type") or "").strip()
+    obj = ((event.get("data") or {}).get("object") or {})
+    if not event_id or event_type not in FULFILLABLE_EVENTS or not isinstance(obj, dict):
+        return None
+    if event_type.startswith("checkout.session") and obj.get("payment_status") not in (None, "paid", "no_payment_required"):
+        return None
 
-    record = {
-        "event": event_type,
-        "time": datetime.now(timezone.utc).isoformat(),
+    amount_minor = _safe_int(
+        obj.get("amount_total", obj.get("amount_paid", obj.get("amount_received", obj.get("amount_due", 0))))
+    )
+    currency = str(obj.get("currency") or "usd").lower()
+    customer_details = obj.get("customer_details") or {}
+    customer_email = customer_details.get("email") or obj.get("customer_email") or obj.get("receipt_email") or ""
+    offer = resolve_offer(obj, amount_minor)
+    reference = str(
+        obj.get("payment_intent")
+        or obj.get("charge")
+        or (obj.get("subscription") and f"{obj.get('subscription')}:{obj.get('id')}")
+        or obj.get("id")
+        or event_id
+    )
+    recurring = event_type == "invoice.paid" or obj.get("mode") == "subscription"
+    return {
+        "payment_reference": reference,
+        "event_id": event_id,
+        "event_type": event_type,
         "customer_email": customer_email,
-        "amount_usd": amount,
-        "offer": offer["name"],
+        "amount_minor": amount_minor,
+        "currency": currency,
+        "offer_name": offer["name"],
         "sku": offer["sku"],
-        "fulfill_by_hours": offer["fulfill_hours"],
-        "payment_intent": payment_intent,
-        "session_id": session.get("id"),
-        "status": "PAID — FULFILL NOW",
+        "fulfill_hours": offer["fulfill_hours"],
+        "session_id": str(obj.get("id") or ""),
+        "recurring": 1 if recurring else 0,
+        "status": "PAID_PENDING_FULFILLMENT",
+        "created_at": utc_now(),
+        "metadata_json": json.dumps(_metadata(obj), sort_keys=True),
     }
 
-    log("=" * 60)
-    log("🔥 REAL MONEY RECEIVED")
-    log(json.dumps(record, indent=2))
-    log(f"ACTION: Email {FULFILLMENT_EMAIL} with lead list request + start the {offer['fulfill_hours']}h clock")
-    log("=" * 60)
 
-    # Persist for later systems
+def record_event(event: dict, payload: bytes) -> tuple[bool, dict | None]:
+    event_id = str(event.get("id") or "").strip()
+    event_type = str(event.get("type") or "").strip()
+    if not event_id or not event_type:
+        raise ValueError("Stripe event must include id and type")
+    payment = extract_payment(event)
+    with _connect() as connection:
+        cursor = connection.execute(
+            "INSERT OR IGNORE INTO stripe_events(event_id, event_type, received_at, payload_sha256) VALUES (?, ?, ?, ?)",
+            (event_id, event_type, utc_now(), hashlib.sha256(payload).hexdigest()),
+        )
+        if cursor.rowcount == 0:
+            return False, None
+        if payment:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO payments(
+                    payment_reference, event_id, event_type, customer_email, amount_minor,
+                    currency, offer_name, sku, fulfill_hours, session_id, recurring,
+                    status, created_at, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                tuple(payment[key] for key in (
+                    "payment_reference", "event_id", "event_type", "customer_email", "amount_minor",
+                    "currency", "offer_name", "sku", "fulfill_hours", "session_id", "recurring",
+                    "status", "created_at", "metadata_json"
+                )),
+            )
+    return True, payment
+
+
+def notify_fulfillment(payment: dict) -> bool:
+    if not FULFILLMENT_WEBHOOK_URL:
+        return False
+    if not FULFILLMENT_WEBHOOK_URL.startswith("https://"):
+        log("FULFILLMENT_WEBHOOK_URL rejected: HTTPS is required")
+        return False
+    payload = {
+        "event": "garcar.payment.received",
+        "payment_reference": payment["payment_reference"],
+        "customer_email": payment["customer_email"],
+        "amount_minor": payment["amount_minor"],
+        "currency": payment["currency"],
+        "offer_name": payment["offer_name"],
+        "sku": payment["sku"],
+        "fulfill_hours": payment["fulfill_hours"],
+        "created_at": payment["created_at"],
+    }
+    body = json.dumps(payload).encode()
+    headers = {"Content-Type": "application/json", "User-Agent": "garcar-payments/2.0"}
+    if FULFILLMENT_WEBHOOK_TOKEN:
+        headers["Authorization"] = f"Bearer {FULFILLMENT_WEBHOOK_TOKEN}"
     try:
-        with open("/tmp/garcar_paid_events.jsonl", "a") as f:
-            f.write(json.dumps(record) + "\n")
-    except Exception:
-        pass
+        with urlopen(Request(FULFILLMENT_WEBHOOK_URL, data=body, headers=headers, method="POST"), timeout=10) as response:
+            return 200 <= response.status < 300
+    except Exception as exc:
+        log(f"Fulfillment notification failed: {type(exc).__name__}")
+        return False
 
-    return record
+
+def aggregate_revenue() -> dict:
+    with _connect() as connection:
+        row = connection.execute(
+            """
+            SELECT COUNT(*) AS paid_events,
+                   COALESCE(SUM(amount_minor), 0) AS gross_minor,
+                   COALESCE(SUM(CASE WHEN recurring = 1 THEN amount_minor ELSE 0 END), 0) AS recurring_collections_minor
+            FROM payments
+            """
+        ).fetchone()
+    return {
+        "paid_events": row["paid_events"],
+        "gross_collected_minor": row["gross_minor"],
+        "recurring_collections_minor": row["recurring_collections_minor"],
+        "currency_note": "Amounts are stored in each payment's currency; do not combine mixed currencies for accounting.",
+        "mrr_note": "Recurring collections are not normalized MRR. Use Stripe Billing for authoritative MRR.",
+    }
 
 
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        log(f"HTTP {args[0]}")
+    server_version = "GarcarPayments/2.0"
 
-    def _json(self, code: int, body: dict):
-        self.send_response(code)
+    def log_message(self, format_string, *args):
+        log(f"HTTP {self.address_string()} {format_string % args}")
+
+    def _json(self, status: int, body: dict):
+        data = json.dumps(body).encode()
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
-        self.wfile.write(json.dumps(body).encode())
+        self.wfile.write(data)
 
     def do_GET(self):
         path = urlparse(self.path).path
@@ -144,75 +289,69 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {
                 "status": "ok",
                 "service": "garcar-emergency-payments",
-                "mode": "bypass-locked-cloudflare-vercel",
-                "offers_live": ["$497 review", "$2500 install"],
-                "webhook": "/stripe-webhook",
-                "time": datetime.now(timezone.utc).isoformat(),
+                "version": "2.0",
+                "webhook_verification_required": not ALLOW_UNVERIFIED_WEBHOOKS,
+                "database": str(DB_PATH),
+                "time": utc_now(),
             })
-        elif path == "/mrr":
-            # Minimal: count paid events from log
-            count = 0
-            total = 0.0
-            try:
-                with open("/tmp/garcar_paid_events.jsonl") as f:
-                    for line in f:
-                        rec = json.loads(line)
-                        count += 1
-                        total += rec.get("amount_usd", 0)
-            except Exception:
-                pass
-            self._json(200, {"paid_events": count, "total_usd": total, "note": "emergency log only"})
+        elif path in ("/revenue", "/mrr"):
+            self._json(200, aggregate_revenue())
         else:
             self._json(404, {"error": "not found"})
 
     def do_POST(self):
-        path = urlparse(self.path).path
-        if path != "/stripe-webhook":
+        if urlparse(self.path).path != "/stripe-webhook":
             self._json(404, {"error": "not found"})
             return
-
-        length = int(self.headers.get("Content-Length", 0))
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._json(400, {"error": "invalid content length"})
+            return
+        if length <= 0 or length > 2_000_000:
+            self._json(413, {"error": "invalid payload size"})
+            return
         payload = self.rfile.read(length)
-        sig = self.headers.get("Stripe-Signature", "")
-
-        # Verify if secret is set; otherwise accept (emergency mode) but log warning
+        signature = self.headers.get("Stripe-Signature", "")
         if STRIPE_WEBHOOK_SECRET:
-            if not verify_stripe_signature(payload, sig, STRIPE_WEBHOOK_SECRET):
-                log("REJECTED: invalid Stripe signature")
+            if not verify_stripe_signature(payload, signature, STRIPE_WEBHOOK_SECRET):
                 self._json(400, {"error": "invalid signature"})
                 return
+        elif not ALLOW_UNVERIFIED_WEBHOOKS:
+            log("Webhook rejected: STRIPE_WEBHOOK_SECRET is not configured")
+            self._json(503, {"error": "webhook verification not configured"})
+            return
         else:
-            log("WARNING: STRIPE_WEBHOOK_SECRET not set — accepting without verify (emergency)")
-
+            log("WARNING: accepting unverified webhook because ALLOW_UNVERIFIED_WEBHOOKS=true")
         try:
             event = json.loads(payload)
-        except Exception:
-            self._json(400, {"error": "bad json"})
+            inserted, payment = record_event(event, payload)
+        except (json.JSONDecodeError, ValueError) as exc:
+            self._json(400, {"error": str(exc)})
             return
-
-        event_type = event.get("type", "")
-        data = event.get("data", {})
-
-        log(f"Received event: {event_type}")
-
-        if event_type in (
-            "checkout.session.completed",
-            "payment_intent.succeeded",
-            "invoice.paid",
-        ):
-            record = fulfill(event_type, data)
-            self._json(200, {"received": True, "fulfilled": record["sku"]})
-        else:
-            # Ack everything else so Stripe stops retrying
-            self._json(200, {"received": True, "ignored": event_type})
+        except sqlite3.Error:
+            log("Database write failed")
+            self._json(500, {"error": "database unavailable"})
+            return
+        if not inserted:
+            self._json(200, {"received": True, "duplicate": True})
+            return
+        notified = notify_fulfillment(payment) if payment else False
+        if payment:
+            log(f"PAYMENT QUEUED reference={payment['payment_reference']} sku={payment['sku']} amount_minor={payment['amount_minor']}")
+        self._json(200, {
+            "received": True,
+            "payment_queued": bool(payment),
+            "fulfillment_notified": notified,
+        })
 
 
 def main():
-    log("Garcar Emergency Payments starting")
-    log(f"PORT={PORT}  webhook_secret_set={bool(STRIPE_WEBHOOK_SECRET)}")
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
-    log(f"Listening on 0.0.0.0:{PORT}")
-    server.serve_forever()
+    init_db()
+    if not STRIPE_WEBHOOK_SECRET and not ALLOW_UNVERIFIED_WEBHOOKS:
+        log("STRIPE_WEBHOOK_SECRET missing: health checks pass, but webhooks are rejected")
+    log(f"Garcar Payments v2 listening on 0.0.0.0:{PORT}; database={DB_PATH}")
+    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 
 if __name__ == "__main__":
