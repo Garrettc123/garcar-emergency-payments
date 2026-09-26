@@ -1,0 +1,25 @@
+name: payment-receiver-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile and unit tests
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python --version
+          python -m py_compile main.py tests/test_main.py
+          python -m unittest discover -s tests -p 'test_*.py' -v
