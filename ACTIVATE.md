@@ -6,6 +6,16 @@ This service records verified Stripe events and queues paid work for fulfillment
 
 Deploy the repository branch to Railway, Render, Fly.io, or a VPS. Mount a persistent volume at `/data`, set `DATA_DIR=/data`, and expose the platform-provided `PORT`.
 
+**Critical:** The container runs as `nobody`. After mounting the volume, ensure the mounted `/data` directory is writable by the container user (uid of `nobody`, typically 65534). Verify write access both immediately after mount and after a container restart. Example (host side before start):
+
+```bash
+mkdir -p /path/to/host/data
+chown -R 65534:65534 /path/to/host/data
+# then mount /path/to/host/data -> /data
+```
+
+If the platform hides the image-prepared directory behind a non-writable mount, SQLite init will fail and the service will not start.
+
 Set these production variables:
 
 ```env
