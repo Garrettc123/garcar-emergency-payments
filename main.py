@@ -202,7 +202,7 @@ def record_event(event: dict, payload: bytes) -> tuple[bool, dict | None]:
         if cursor.rowcount == 0:
             return False, None
         if payment:
-            connection.execute(
+            payment_cursor = connection.execute(
                 """
                 INSERT OR IGNORE INTO payments(
                     payment_reference, event_id, event_type, customer_email, amount_minor,
@@ -216,6 +216,8 @@ def record_event(event: dict, payload: bytes) -> tuple[bool, dict | None]:
                     "status", "created_at", "metadata_json"
                 )),
             )
+            if payment_cursor.rowcount == 0:
+                payment = None
     return True, payment
 
 
@@ -334,11 +336,42 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"error": "database unavailable"})
             return
         if not inserted:
+            # Duplicate event: still attempt fulfillment if a pending payment exists for this event
+            # (covers prior failed notification that returned 200).
+            pending = None
+            if payment is None:
+                try:
+                    event_id = str(event.get("id") or "").strip()
+                    with _connect() as connection:
+                        row = connection.execute(
+                            "SELECT * FROM payments WHERE event_id = ? AND status = ? LIMIT 1",
+                            (event_id, "PAID_PENDING_FULFILLMENT"),
+                        ).fetchone()
+                        if row:
+                            pending = dict(row)
+                except Exception:
+                    pending = None
+            if pending and FULFILLMENT_WEBHOOK_URL:
+                notified = notify_fulfillment(pending)
+                if not notified:
+                    self._json(502, {"received": True, "duplicate": True, "fulfillment_retry_failed": True})
+                    return
+                self._json(200, {"received": True, "duplicate": True, "fulfillment_notified": True})
+                return
             self._json(200, {"received": True, "duplicate": True})
             return
         notified = notify_fulfillment(payment) if payment else False
         if payment:
             log(f"PAYMENT QUEUED reference={payment['payment_reference']} sku={payment['sku']} amount_minor={payment['amount_minor']}")
+            if FULFILLMENT_WEBHOOK_URL and not notified:
+                # Return non-2xx so Stripe retries; payment row already persisted.
+                self._json(502, {
+                    "received": True,
+                    "payment_queued": True,
+                    "fulfillment_notified": False,
+                    "error": "fulfillment notification failed — will retry on Stripe redelivery",
+                })
+                return
         self._json(200, {
             "received": True,
             "payment_queued": bool(payment),
