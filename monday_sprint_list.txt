@@ -1,0 +1,30 @@
+Monday 2026-09-28 Lead Leak Audit sprint — verified inboxes only
+Do not send: contact@tarrantroofing.com, info@tarrantroofing.com, contact@allianceroofingdfw.com, atlas+cleburne-comfort@garcar.io, info@priorityroofs.com, office@reformed-roofing.com, marcus@lonestarroofingco.com, contact@dfwpremiumroofing.com, info@goodcontractors.com
+
+ALREADY SENT 2026-09-27 (do not duplicate Monday unless no reply):
+1. don@dfwhousingpartners.net — SENT close
+2. blake@dfwroofingpro.com — SENT close
+3. pete@allianceroofingus.com — SENT (no bounce yet)
+4. hirecomfortpros@gmail.com — SENT (no bounce yet)
+5. office@gwmtexas.com — SENT replacement for blocked Tarrant
+6. Service@DFWplumber.com — SENT extra after Tarrant block
+
+MONDAY NEW (10) — public pages, not previously bounced:
+1. chrismoran@dfwhousingpartners.net — COO, DFW Housing Partners (Don already has the $47)
+2. skylar@dfwhousingpartners.net — hail/fire advisor
+3. estimating@chillpoint.us — Chill Point Mechanical, Cleburne
+4. contact@btpnorthtx.com — BTP North Texas HVAC
+5. Tech@bptnorthtx.com — BTP tech desk (note possible typo domain bpt vs btp — verify MX before send)
+6. facandheating@aol.com — Franklin A/C and Heating DFW
+7. info@DFWsidingandpatio.com — DFW Siding and Patio
+8. office@gwmtexas.com — SKIP if Sunday mail delivered
+9. hirecomfortpros@gmail.com — SKIP if Sunday mail delivered
+10. pete@allianceroofingus.com — SKIP if Sunday mail delivered
+
+If 5/6/7 MX-fail at send time, swap to:
+- Cayden@dfwhousingpartners.net
+- Gabriel@dfwhousingpartners.net
+- Anikka@dfwhousingpartners.net
+
+SKU: $47 https://buy.stripe.com/dRm8wPbb72pY2Mz8BR43S1D
+From: Gmail API gwc2780@gmail.com until SMTP preflight is green.
