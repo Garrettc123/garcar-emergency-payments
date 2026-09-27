@@ -132,49 +132,50 @@ def resolve_offer(obj: dict, amount_minor: int) -> dict:
             "fulfill_hours": hours if 1 <= hours <= 720 else 48,
         }
     if amount_minor in OFFER_BY_AMOUNT:
-        return OFFER_BY_AMOUNT[amount_minor]
+        return OFFER_BY_AMOUNT[amount_minor].copy()
     if amount_minor == 49700:
         return {
-            "name": "$497 purchase — verify source link before fulfillment",
             "sku": "manual-review-497",
+            "name": "$497 offer (manual review — add sku metadata)",
             "fulfill_hours": 48,
         }
     return {
-        "name": f"Unmapped payment ({amount_minor} minor units)",
-        "sku": "manual-review-unmapped",
+        "sku": f"amount-{amount_minor}",
+        "name": f"Unmapped amount {amount_minor}",
         "fulfill_hours": 48,
     }
 
 
 def extract_payment(event: dict) -> dict | None:
-    event_id = str(event.get("id") or "").strip()
-    event_type = str(event.get("type") or "").strip()
-    obj = ((event.get("data") or {}).get("object") or {})
-    if not event_id or event_type not in FULFILLABLE_EVENTS or not isinstance(obj, dict):
+    event_type = str(event.get("type") or "")
+    if event_type not in FULFILLABLE_EVENTS:
         return None
-    if event_type.startswith("checkout.session") and obj.get("payment_status") not in (None, "paid", "no_payment_required"):
+    obj = (event.get("data") or {}).get("object") or {}
+    if not isinstance(obj, dict):
         return None
-
-    amount_minor = _safe_int(
-        obj.get("amount_total", obj.get("amount_paid", obj.get("amount_received", obj.get("amount_due", 0))))
-    )
-    currency = str(obj.get("currency") or "usd").lower()
-    customer_details = obj.get("customer_details") or {}
-    customer_email = customer_details.get("email") or obj.get("customer_email") or obj.get("receipt_email") or ""
+    if event_type.startswith("checkout.session"):
+        if str(obj.get("payment_status") or "").lower() != "paid":
+            return None
+        amount_minor = _safe_int(obj.get("amount_total"))
+        currency = str(obj.get("currency") or "usd").lower()
+        customer_email = ((obj.get("customer_details") or {}).get("email") or obj.get("customer_email") or "")
+        payment_intent = str(obj.get("payment_intent") or obj.get("id") or "")
+        recurring = False
+    else:  # invoice.paid
+        amount_minor = _safe_int(obj.get("amount_paid"))
+        currency = str(obj.get("currency") or "usd").lower()
+        customer_email = str(obj.get("customer_email") or "")
+        payment_intent = str(obj.get("payment_intent") or obj.get("id") or "")
+        recurring = True
+    if amount_minor <= 0:
+        return None
     offer = resolve_offer(obj, amount_minor)
-    reference = str(
-        obj.get("payment_intent")
-        or obj.get("charge")
-        or (obj.get("subscription") and f"{obj.get('subscription')}:{obj.get('id')}")
-        or obj.get("id")
-        or event_id
-    )
-    recurring = event_type == "invoice.paid" or obj.get("mode") == "subscription"
+    payment_reference = payment_intent or f"{event.get('id')}-{amount_minor}"
     return {
-        "payment_reference": reference,
-        "event_id": event_id,
+        "payment_reference": payment_reference,
+        "event_id": str(event.get("id") or ""),
         "event_type": event_type,
-        "customer_email": customer_email,
+        "customer_email": str(customer_email or ""),
         "amount_minor": amount_minor,
         "currency": currency,
         "offer_name": offer["name"],
@@ -221,12 +222,30 @@ def record_event(event: dict, payload: bytes) -> tuple[bool, dict | None]:
     return True, payment
 
 
+def mark_fulfillment_notified(payment_reference: str) -> bool:
+    """Atomically transition a pending payment to FULFILLMENT_NOTIFIED. Returns True if claimed."""
+    with _connect() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE payments
+            SET status = 'FULFILLMENT_NOTIFIED'
+            WHERE payment_reference = ? AND status = 'PAID_PENDING_FULFILLMENT'
+            """,
+            (payment_reference,),
+        )
+        return cursor.rowcount == 1
+
+
 def notify_fulfillment(payment: dict) -> bool:
     if not FULFILLMENT_WEBHOOK_URL:
         return False
     if not FULFILLMENT_WEBHOOK_URL.startswith("https://"):
         log("FULFILLMENT_WEBHOOK_URL rejected: HTTPS is required")
         return False
+    # Claim first so concurrent/redelivered events cannot double-notify.
+    if not mark_fulfillment_notified(payment["payment_reference"]):
+        log(f"Fulfillment already claimed or not pending: {payment['payment_reference']}")
+        return True  # Treat as success; already handled.
     payload = {
         "event": "garcar.payment.received",
         "payment_reference": payment["payment_reference"],
@@ -237,16 +256,34 @@ def notify_fulfillment(payment: dict) -> bool:
         "sku": payment["sku"],
         "fulfill_hours": payment["fulfill_hours"],
         "created_at": payment["created_at"],
+        "idempotency_key": payment["payment_reference"],
     }
     body = json.dumps(payload).encode()
-    headers = {"Content-Type": "application/json", "User-Agent": "garcar-payments/2.0"}
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "garcar-payments/2.0",
+        "Idempotency-Key": payment["payment_reference"],
+    }
     if FULFILLMENT_WEBHOOK_TOKEN:
         headers["Authorization"] = f"Bearer {FULFILLMENT_WEBHOOK_TOKEN}"
     try:
         with urlopen(Request(FULFILLMENT_WEBHOOK_URL, data=body, headers=headers, method="POST"), timeout=10) as response:
-            return 200 <= response.status < 300
+            ok = 200 <= response.status < 300
+            if not ok:
+                # Revert claim so Stripe redelivery can retry.
+                with _connect() as connection:
+                    connection.execute(
+                        "UPDATE payments SET status = 'PAID_PENDING_FULFILLMENT' WHERE payment_reference = ?",
+                        (payment["payment_reference"],),
+                    )
+            return ok
     except Exception as exc:
         log(f"Fulfillment notification failed: {type(exc).__name__}")
+        with _connect() as connection:
+            connection.execute(
+                "UPDATE payments SET status = 'PAID_PENDING_FULFILLMENT' WHERE payment_reference = ?",
+                (payment["payment_reference"],),
+            )
         return False
 
 
@@ -280,21 +317,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(data)
 
     def do_GET(self):
         path = urlparse(self.path).path
-        if path in ("/", "/health", "/livez", "/readyz"):
+        if path == "/health":
             self._json(200, {
-                "status": "ok",
-                "service": "garcar-emergency-payments",
-                "version": "2.0",
-                "webhook_verification_required": not ALLOW_UNVERIFIED_WEBHOOKS,
+                "ok": True,
+                "webhook_verification": bool(STRIPE_WEBHOOK_SECRET) or ALLOW_UNVERIFIED_WEBHOOKS,
+                "fulfillment_configured": bool(FULFILLMENT_WEBHOOK_URL),
                 "database": str(DB_PATH),
-                "time": utc_now(),
             })
         elif path in ("/revenue", "/mrr"):
             self._json(200, aggregate_revenue())
@@ -349,8 +382,10 @@ class Handler(BaseHTTPRequestHandler):
                         ).fetchone()
                         if row:
                             pending = dict(row)
-                except Exception:
-                    pending = None
+                except sqlite3.Error as db_exc:
+                    log(f"Database lookup failed on duplicate event: {db_exc}")
+                    self._json(500, {"error": "database unavailable", "duplicate": True})
+                    return
             if pending and FULFILLMENT_WEBHOOK_URL:
                 notified = notify_fulfillment(pending)
                 if not notified:
