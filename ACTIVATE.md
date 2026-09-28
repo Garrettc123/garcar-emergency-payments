@@ -6,17 +6,7 @@ This service records verified Stripe events and queues paid work for fulfillment
 
 Deploy the repository branch to Railway, Render, Fly.io, or a VPS. Mount a persistent volume at `/data`, set `DATA_DIR=/data`, and expose the platform-provided `PORT`.
 
-**Critical:** The container runs as `nobody`. After mounting the volume, ensure the mounted `/data` directory is writable by the container user (uid of `nobody`, typically 65534). Verify write access both immediately after mount and after a container restart. Example (host side before start):
-
-```bash
-mkdir -p /path/to/host/data
-chown -R 65534:65534 /path/to/host/data
-# then mount /path/to/host/data -> /data
-```
-
-If the platform hides the image-prepared directory behind a non-writable mount, SQLite init will fail and the service will not start.
-
-Set these production variables:
+**Critical:** The container runs as `nobody`. After mounting the volume, ensure `/data` is writable by uid 65534.
 
 ```env
 STRIPE_WEBHOOK_SECRET=whsec_...
@@ -29,31 +19,28 @@ FULFILLMENT_WEBHOOK_TOKEN=YOUR-LONG-RANDOM-TOKEN
 
 ## Connect Stripe
 
-In the Stripe Dashboard, create one endpoint at:
+Endpoint:
 
 ```text
 https://YOUR-HOST/stripe-webhook
 ```
 
-Subscribe to `checkout.session.completed`, `checkout.session.async_payment_succeeded`, and `invoice.paid`. Copy Stripe's endpoint signing secret into `STRIPE_WEBHOOK_SECRET` and restart the service.
+Subscribe to `checkout.session.completed`, `checkout.session.async_payment_succeeded`, and `invoice.paid`.
 
-## Tag offers
+## Tag offers (live 2026-09-27)
 
-The storefront currently exposes multiple offers, including more than one `$497` purchase. Amount alone is not enough to identify the buyer's deliverable. Add distinct metadata to every Payment Link:
+| Offer | sku | Link | SLA |
+|---|---|---|---|
+| Lead Leak Audit | LLA-47 | https://buy.stripe.com/3cI00j7YV0hQgDp8BR43S2v | 48 hours |
+| Mark the leads that sat | MLS-497 | https://buy.stripe.com/8x2eVddjf0hQ86Tf0f43S2h | 48 hours |
+| Callback clock install | LB-2500 | https://buy.stripe.com/14AdR95QN3u2af14lB43S2j | 3 business days after inputs |
 
-| Offer | Required `sku` | Suggested SLA |
-|---|---|---|
-| $47 Contractor Lead Leak Audit | `contractor-audit-47` | 48 hours |
-| $497/week Workflow Sprint | `workflow-sprint-497` | Define in signed scope |
-| $497 Real Estate Lead-List Review | `lead-list-review-497` | 48 hours |
-| $2,500 CRM Safeguard | `crm-safeguard-2500` | 72 hours |
+Required metadata on every Payment Link: `sku`, `offer_name`, `fulfill_hours`.
 
-Recommended metadata fields are `sku`, `offer_name`, and `fulfill_hours`.
+Primary wedge until 1 Oct 2026: **LLA-47** against Google LSA missed-call billing.
 
 ## Prove the payment loop
 
-Run the unit tests, then use Stripe CLI against the deployed endpoint. Confirm one event creates one payment, a replay is marked duplicate, the payment remains after a restart, and the fulfillment destination receives the alert.
+One verified paid event = one payment row. Replays are duplicates. Restarts keep the row. Fulfillment URL gets the alert.
 
-## Operating rule
-
-Do not report forecasts, generated test transactions, or Checkout links as revenue. Revenue is recognized here only when a verified paid Stripe event is recorded. Use Stripe's own reports for accounting and subscription MRR.
+Do not report test cards, 4242, or Checkout-link clicks as revenue.
