@@ -1,0 +1,7 @@
+{
+  "system": "garcar-emergency-payments",
+  "tier": "CASH",
+  "stamp": "sidecar",
+  "reason": "17KB webhook main.py is the live receiver",
+  "stamped_by": "garcar-repo-foundry"
+}
