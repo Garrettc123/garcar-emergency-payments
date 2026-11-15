@@ -131,8 +131,6 @@ def resolve_offer(obj: dict, amount_minor: int) -> dict:
             "name": name or sku,
             "fulfill_hours": hours if 1 <= hours <= 720 else 48,
         }
-    if amount_minor in OFFER_BY_AMOUNT:
-        return OFFER_BY_AMOUNT[amount_minor].copy()
     if amount_minor == 49700:
         return {
             "sku": "manual-review-497",
@@ -140,8 +138,8 @@ def resolve_offer(obj: dict, amount_minor: int) -> dict:
             "fulfill_hours": 48,
         }
     return {
-        "sku": f"amount-{amount_minor}",
-        "name": f"Unmapped amount {amount_minor}",
+        "sku": "manual-review-unattributed",
+        "name": f"Unattributed payment ({amount_minor} minor units) — manual review",
         "fulfill_hours": 48,
     }
 
@@ -360,6 +358,12 @@ class Handler(BaseHTTPRequestHandler):
             log("WARNING: accepting unverified webhook because ALLOW_UNVERIFIED_WEBHOOKS=true")
         try:
             event = json.loads(payload)
+            if not isinstance(event, dict):
+                raise ValueError("Stripe event must be an object")
+            # A production endpoint must never treat synthetic / test-mode events as revenue.
+            if event.get("livemode") is not True:
+                self._json(200, {"received": True, "ignored": True, "reason": "non_live_event"})
+                return
             inserted, payment = record_event(event, payload)
         except (json.JSONDecodeError, ValueError) as exc:
             self._json(400, {"error": str(exc)})
