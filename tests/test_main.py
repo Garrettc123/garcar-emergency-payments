@@ -42,6 +42,7 @@ class PaymentReceiverTests(unittest.TestCase):
 
     def test_idempotent_event_and_payment(self):
         event = self.checkout_event()
+        event["data"]["object"]["metadata"] = {"sku": "contractor-audit-47", "offer_name": "Contractor Audit"}
         payload = json.dumps(event).encode()
         inserted, payment = main.record_event(event, payload)
         duplicate, second_payment = main.record_event(event, payload)
@@ -52,6 +53,12 @@ class PaymentReceiverTests(unittest.TestCase):
         totals = main.aggregate_revenue()
         self.assertEqual(totals["paid_events"], 1)
         self.assertEqual(totals["gross_collected_minor"], 4700)
+
+    def test_untagged_2500_never_guesses_offer(self):
+        event = self.checkout_event("evt_2500")
+        event["data"]["object"]["amount_total"] = 250000
+        payment = main.extract_payment(event)
+        self.assertEqual(payment["sku"], "manual-review-unattributed")
 
     def test_ambiguous_497_requires_manual_review(self):
         event = self.checkout_event("evt_497")
