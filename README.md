@@ -109,3 +109,13 @@ Do not send paid traffic until all of these pass:
 ## Founder
 
 Garrett Carrol · Grandview / Kopperl, Texas
+
+## Readiness and private metrics (security hardening)
+
+- GET `/health` is public liveness and does not expose storage paths or revenue.
+- GET `/readyz` returns HTTP 503 until the signed-webhook receiver and database are ready; configure Railway's healthcheck path to `/readyz` after rollout.
+- GET `/revenue` and `/mrr` now require `Authorization: Bearer <METRICS_READ_TOKEN>`; without the variable the endpoint fails closed with HTTP 503.
+- Unsigned webhook testing requires both `GARCAR_ENV=development` and `ALLOW_UNVERIFIED_WEBHOOKS=true`, outside Railway. No production unsigned bypass.
+- Cross-currency totals appear in `by_currency`. A global minor-unit gross is `null` when multiple currencies exist.
+
+Before merging or deploying this change, provision a distinct, strong `METRICS_READ_TOKEN` on the payment receiver and update any authorized metrics consumers. Do not log or share its value. This PR does not alter the currently deployed production endpoint.
