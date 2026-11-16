@@ -17,12 +17,6 @@ STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 NOTIFICATION_LEASE_SECONDS = 120
 MAX_NOTIFICATION_ATTEMPTS = 12
 METRICS_READ_TOKEN = os.environ.get("METRICS_READ_TOKEN", "")
-# Unsigned webhook tests are permitted only when explicitly enabled outside Railway.
-ALLOW_UNVERIFIED_WEBHOOKS = (
-    os.environ.get("ALLOW_UNVERIFIED_WEBHOOKS", "false").lower() == "true"
-    and os.environ.get("GARCAR_ENV", "").lower() in {"local", "development", "test"}
-    and not os.environ.get("RAILWAY_ENVIRONMENT")
-)
 FULFILLMENT_WEBHOOK_URL = os.environ.get("FULFILLMENT_WEBHOOK_URL", "")
 FULFILLMENT_WEBHOOK_TOKEN = os.environ.get("FULFILLMENT_WEBHOOK_TOKEN", "")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
@@ -363,6 +357,10 @@ def notify_fulfillment(payment: dict) -> bool:
     if not FULFILLMENT_WEBHOOK_URL.startswith("https://"):
         log("FULFILLMENT_WEBHOOK_URL rejected: HTTPS is required")
         return False
+    # Never transmit customer identifiers or payment metadata to an unauthenticated sink.
+    if not FULFILLMENT_WEBHOOK_TOKEN:
+        log("Fulfillment notification held: authentication token not configured")
+        return False
     reference = payment["payment_reference"]
     token = claim_notification(reference)
     if not token:
@@ -469,7 +467,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {
                 "ok": True,
                 "webhook_verification": bool(STRIPE_WEBHOOK_SECRET),
-                "fulfillment_configured": bool(FULFILLMENT_WEBHOOK_URL),
+                "fulfillment_configured": bool(FULFILLMENT_WEBHOOK_URL and FULFILLMENT_WEBHOOK_TOKEN),
             })
         elif path == "/readyz":
             try:
@@ -483,7 +481,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ready": ready,
                 "webhook_verification": bool(STRIPE_WEBHOOK_SECRET),
                 "database_ready": database_ready,
-                "fulfillment_configured": bool(FULFILLMENT_WEBHOOK_URL),
+                "fulfillment_configured": bool(FULFILLMENT_WEBHOOK_URL and FULFILLMENT_WEBHOOK_TOKEN),
             })
         elif path in ("/revenue", "/mrr"):
             if not METRICS_READ_TOKEN:
@@ -510,16 +508,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         payload = self.rfile.read(length)
         signature = self.headers.get("Stripe-Signature", "")
-        if STRIPE_WEBHOOK_SECRET:
-            if not verify_stripe_signature(payload, signature, STRIPE_WEBHOOK_SECRET):
-                self._json(400, {"error": "invalid signature"})
-                return
-        elif not ALLOW_UNVERIFIED_WEBHOOKS:
+        if not STRIPE_WEBHOOK_SECRET:
             log("Webhook rejected: STRIPE_WEBHOOK_SECRET is not configured")
             self._json(503, {"error": "webhook verification not configured"})
             return
-        else:
-            log("WARNING: accepting unverified webhook because ALLOW_UNVERIFIED_WEBHOOKS=true")
+        if not verify_stripe_signature(payload, signature, STRIPE_WEBHOOK_SECRET):
+            self._json(400, {"error": "invalid signature"})
+            return
         try:
             event = json.loads(payload)
             if not isinstance(event, dict):
@@ -594,7 +589,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     init_db()
-    if not STRIPE_WEBHOOK_SECRET and not ALLOW_UNVERIFIED_WEBHOOKS:
+    if not STRIPE_WEBHOOK_SECRET:
         log("STRIPE_WEBHOOK_SECRET missing: health checks pass, but webhooks are rejected")
     log(f"Garcar Payments v2 listening on 0.0.0.0:{PORT}; database={DB_PATH}")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
