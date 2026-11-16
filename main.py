@@ -14,7 +14,13 @@ from urllib.request import Request, urlopen
 
 PORT = int(os.environ.get("PORT", "8080"))
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
-ALLOW_UNVERIFIED_WEBHOOKS = os.environ.get("ALLOW_UNVERIFIED_WEBHOOKS", "false").lower() == "true"
+METRICS_READ_TOKEN = os.environ.get("METRICS_READ_TOKEN", "")
+# Unsigned webhook tests are permitted only when explicitly enabled outside Railway.
+ALLOW_UNVERIFIED_WEBHOOKS = (
+    os.environ.get("ALLOW_UNVERIFIED_WEBHOOKS", "false").lower() == "true"
+    and os.environ.get("GARCAR_ENV", "").lower() in {"local", "development", "test"}
+    and not os.environ.get("RAILWAY_ENVIRONMENT")
+)
 FULFILLMENT_WEBHOOK_URL = os.environ.get("FULFILLMENT_WEBHOOK_URL", "")
 FULFILLMENT_WEBHOOK_TOKEN = os.environ.get("FULFILLMENT_WEBHOOK_TOKEN", "")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
@@ -113,6 +119,13 @@ def _safe_int(value, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def metrics_authorized(authorization: str) -> bool:
+    """Fail closed when no private metrics token has been provisioned."""
+    return bool(METRICS_READ_TOKEN) and hmac.compare_digest(
+        authorization, f"Bearer {METRICS_READ_TOKEN}"
+    )
 
 
 def _metadata(obj: dict) -> dict:
@@ -286,20 +299,42 @@ def notify_fulfillment(payment: dict) -> bool:
 
 
 def aggregate_revenue() -> dict:
+    # PaymentIntents and the Stripe ledger remain authoritative; this is only
+    # a receiver-level record of distinct paid payment references.
     with _connect() as connection:
-        row = connection.execute(
+        rows = connection.execute(
             """
-            SELECT COUNT(*) AS paid_events,
+            SELECT currency, COUNT(*) AS paid_events,
                    COALESCE(SUM(amount_minor), 0) AS gross_minor,
-                   COALESCE(SUM(CASE WHEN recurring = 1 THEN amount_minor ELSE 0 END), 0) AS recurring_collections_minor
+                   COALESCE(SUM(CASE WHEN recurring = 1 THEN amount_minor ELSE 0 END), 0)
+                       AS recurring_collections_minor
             FROM payments
+            GROUP BY currency
+            ORDER BY currency
             """
-        ).fetchone()
+        ).fetchall()
+    by_currency = {
+        row["currency"]: {
+            "paid_events": row["paid_events"],
+            "gross_collected_minor": row["gross_minor"],
+            "recurring_collections_minor": row["recurring_collections_minor"],
+        }
+        for row in rows
+    }
+    unambiguous = next(iter(by_currency.values())) if len(by_currency) == 1 else None
     return {
-        "paid_events": row["paid_events"],
-        "gross_collected_minor": row["gross_minor"],
-        "recurring_collections_minor": row["recurring_collections_minor"],
-        "currency_note": "Amounts are stored in each payment's currency; do not combine mixed currencies for accounting.",
+        "paid_events": sum(r["paid_events"] for r in by_currency.values()),
+        # Do not add incompatible minor units (USD + EUR, etc.).
+        "gross_collected_minor": (
+            unambiguous["gross_collected_minor"] if unambiguous else
+            (0 if not by_currency else None)
+        ),
+        "recurring_collections_minor": (
+            unambiguous["recurring_collections_minor"] if unambiguous else
+            (0 if not by_currency else None)
+        ),
+        "by_currency": by_currency,
+        "currency_note": "Totals are grouped by currency; global minor-unit sums are omitted when currencies differ.",
         "mrr_note": "Recurring collections are not normalized MRR. Use Stripe Billing for authoritative MRR.",
     }
 
@@ -314,6 +349,7 @@ class Handler(BaseHTTPRequestHandler):
         data = json.dumps(body).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -323,11 +359,30 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             self._json(200, {
                 "ok": True,
-                "webhook_verification": bool(STRIPE_WEBHOOK_SECRET) or ALLOW_UNVERIFIED_WEBHOOKS,
+                "webhook_verification": bool(STRIPE_WEBHOOK_SECRET),
                 "fulfillment_configured": bool(FULFILLMENT_WEBHOOK_URL),
-                "database": str(DB_PATH),
+            })
+        elif path == "/readyz":
+            try:
+                with _connect() as connection:
+                    connection.execute("SELECT 1").fetchone()
+                database_ready = True
+            except sqlite3.Error:
+                database_ready = False
+            ready = bool(STRIPE_WEBHOOK_SECRET) and database_ready
+            self._json(200 if ready else 503, {
+                "ready": ready,
+                "webhook_verification": bool(STRIPE_WEBHOOK_SECRET),
+                "database_ready": database_ready,
+                "fulfillment_configured": bool(FULFILLMENT_WEBHOOK_URL),
             })
         elif path in ("/revenue", "/mrr"):
+            if not METRICS_READ_TOKEN:
+                self._json(503, {"error": "private metrics not configured"})
+                return
+            if not metrics_authorized(self.headers.get("Authorization", "")):
+                self._json(401, {"error": "unauthorized"})
+                return
             self._json(200, aggregate_revenue())
         else:
             self._json(404, {"error": "not found"})
