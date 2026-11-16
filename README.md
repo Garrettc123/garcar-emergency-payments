@@ -9,7 +9,7 @@ The earlier emergency receiver could accept unsigned webhooks when the signing s
 ## Production behavior
 
 - Rejects webhooks unless `STRIPE_WEBHOOK_SECRET` is configured.
-- Allows unsigned events only when `ALLOW_UNVERIFIED_WEBHOOKS=true` is explicitly set for local testing.
+- Rejects unsigned events in every environment, even if a legacy `ALLOW_UNVERIFIED_WEBHOOKS` testing flag is present.
 - Verifies Stripe `v1` signatures and rejects stale timestamps.
 - Stores Stripe event IDs and payment references in SQLite with uniqueness constraints.
 - Ignores duplicate deliveries and unpaid Checkout sessions.
@@ -33,13 +33,7 @@ FULFILLMENT_WEBHOOK_URL=https://your-secure-automation.example/webhook
 FULFILLMENT_WEBHOOK_TOKEN=replace-with-a-long-secret
 ```
 
-Local unsigned testing only:
-
-```env
-ALLOW_UNVERIFIED_WEBHOOKS=true
-```
-
-Never enable that flag in production.
+Local and staging tests must use properly signed fixture events or Stripe CLI. The legacy `ALLOW_UNVERIFIED_WEBHOOKS` variable is ignored; do not rely on unsigned payment events.
 
 ## Run
 
