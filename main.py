@@ -14,6 +14,8 @@ from urllib.request import Request, urlopen
 
 PORT = int(os.environ.get("PORT", "8080"))
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+NOTIFICATION_LEASE_SECONDS = 120
+MAX_NOTIFICATION_ATTEMPTS = 12
 METRICS_READ_TOKEN = os.environ.get("METRICS_READ_TOKEN", "")
 # Unsigned webhook tests are permitted only when explicitly enabled outside Railway.
 ALLOW_UNVERIFIED_WEBHOOKS = (
@@ -84,6 +86,33 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_payments_created_at ON payments(created_at);
             """
+        )
+        # Existing production volumes retain all payment evidence. Add lease
+        # columns incrementally; never drop/recreate the payments table.
+        existing = {
+            row["name"] for row in connection.execute("PRAGMA table_info(payments)")
+        }
+        additions = {
+            "delivery_claim_token": "TEXT",
+            "delivery_claim_until": "INTEGER",
+            "delivery_attempts": "INTEGER NOT NULL DEFAULT 0",
+            "delivery_accepted_at": "TEXT",
+            "delivery_last_error": "TEXT",
+        }
+        for name, declaration in additions.items():
+            if name not in existing:
+                connection.execute(f"ALTER TABLE payments ADD COLUMN {name} {declaration}")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_payment_delivery_state "
+            "ON payments(status, delivery_claim_until)"
+        )
+        # Old versions marked FULFILLMENT_NOTIFIED BEFORE actually sending.
+        # They are ambiguous: do not resend or silently treat as delivered.
+        connection.execute(
+            """UPDATE payments
+               SET status = 'DELIVERY_RECONCILIATION_REQUIRED'
+               WHERE status = 'FULFILLMENT_NOTIFIED'
+                 AND delivery_accepted_at IS NULL"""
         )
 
 
@@ -239,22 +268,93 @@ def record_event(event: dict, payload: bytes) -> tuple[bool, dict | None]:
     return True, payment
 
 
-def mark_fulfillment_notified(payment_reference: str) -> bool:
-    """Atomically transition a pending payment to FULFILLMENT_NOTIFIED. Returns True if claimed."""
+def claim_notification(payment_reference: str, now: int | None = None) -> str | None:
+    """Lease one eligible payment; a crash leaves an expiring recoverable claim.
+
+    The compare-and-swap UPDATE prevents multiple receiver threads from sending
+    the same payment concurrently. The downstream endpoint must also dedupe
+    Idempotency-Key because failure after an HTTP 2xx may be ambiguous.
+    """
+    issued_at = int(time.time()) if now is None else now
+    token = os.urandom(16).hex()
     with _connect() as connection:
-        cursor = connection.execute(
+        changed = connection.execute(
             """
             UPDATE payments
-            SET status = 'FULFILLMENT_NOTIFIED'
-            WHERE payment_reference = ? AND status = 'PAID_PENDING_FULFILLMENT'
+               SET status = 'NOTIFICATION_IN_FLIGHT',
+                   delivery_claim_token = ?,
+                   delivery_claim_until = ?,
+                   delivery_attempts = delivery_attempts + 1
+             WHERE payment_reference = ?
+               AND delivery_attempts < ?
+               AND sku <> 'metadata-offer'
+               AND sku NOT LIKE 'manual-review-%'
+               AND TRIM(sku) <> ''
+               AND (
+                    status = 'PAID_PENDING_FULFILLMENT'
+                    OR (
+                        status = 'NOTIFICATION_IN_FLIGHT'
+                        AND delivery_claim_until IS NOT NULL
+                        AND delivery_claim_until <= ?
+                    )
+               )
             """,
-            (payment_reference,),
+            (token, issued_at + NOTIFICATION_LEASE_SECONDS,
+             payment_reference, MAX_NOTIFICATION_ATTEMPTS, issued_at),
         )
-        return cursor.rowcount == 1
+        return token if changed.rowcount == 1 else None
+
+
+def notification_accepted(payment_reference: str) -> bool:
+    with _connect() as connection:
+        row = connection.execute(
+            "SELECT status FROM payments WHERE payment_reference = ?",
+            (payment_reference,),
+        ).fetchone()
+    return bool(row and row["status"] == "NOTIFICATION_ACCEPTED")
+
+
+def complete_notification(payment_reference: str, token: str) -> bool:
+    """Persist explicit downstream HTTP acceptance, not customer fulfillment."""
+    with _connect() as connection:
+        updated = connection.execute(
+            """UPDATE payments
+               SET status = 'NOTIFICATION_ACCEPTED',
+                   delivery_accepted_at = ?,
+                   delivery_claim_token = NULL,
+                   delivery_claim_until = NULL,
+                   delivery_last_error = NULL
+               WHERE payment_reference = ?
+                 AND delivery_claim_token = ?
+                 AND status = 'NOTIFICATION_IN_FLIGHT'""",
+            (utc_now(), payment_reference, token),
+        )
+        return updated.rowcount == 1
+
+
+def release_notification(payment_reference: str, token: str, error_kind: str) -> bool:
+    """Only the active lease owner may release or exhaust a delivery claim."""
+    with _connect() as connection:
+        updated = connection.execute(
+            """UPDATE payments
+               SET status = CASE
+                   WHEN delivery_attempts >= ? THEN 'DELIVERY_MANUAL_INTERVENTION'
+                   ELSE 'PAID_PENDING_FULFILLMENT'
+               END,
+               delivery_claim_token = NULL,
+               delivery_claim_until = NULL,
+               delivery_last_error = ?
+               WHERE payment_reference = ?
+                 AND delivery_claim_token = ?
+                 AND status = 'NOTIFICATION_IN_FLIGHT'""",
+            (MAX_NOTIFICATION_ATTEMPTS, error_kind[:100], payment_reference, token),
+        )
+        return updated.rowcount == 1
 
 
 def notify_fulfillment(payment: dict) -> bool:
-    # A valid receipt does not establish which product should be delivered.
+    # This is an internal notification; the receiving service still needs
+    # explicit approval before any external outreach, charge or final delivery.
     if requires_manual_review(payment):
         log("Fulfillment held: payment requires manual offer attribution")
         return False
@@ -263,13 +363,14 @@ def notify_fulfillment(payment: dict) -> bool:
     if not FULFILLMENT_WEBHOOK_URL.startswith("https://"):
         log("FULFILLMENT_WEBHOOK_URL rejected: HTTPS is required")
         return False
-    # Claim first so concurrent/redelivered events cannot double-notify.
-    if not mark_fulfillment_notified(payment["payment_reference"]):
-        log(f"Fulfillment already claimed or not pending: {payment['payment_reference']}")
-        return True  # Treat as success; already handled.
+    reference = payment["payment_reference"]
+    token = claim_notification(reference)
+    if not token:
+        # An in-flight (or exhausted) claim is NOT successful delivery.
+        return notification_accepted(reference)
     payload = {
         "event": "garcar.payment.received",
-        "payment_reference": payment["payment_reference"],
+        "payment_reference": reference,
         "customer_email": payment["customer_email"],
         "amount_minor": payment["amount_minor"],
         "currency": payment["currency"],
@@ -277,34 +378,32 @@ def notify_fulfillment(payment: dict) -> bool:
         "sku": payment["sku"],
         "fulfill_hours": payment["fulfill_hours"],
         "created_at": payment["created_at"],
-        "idempotency_key": payment["payment_reference"],
+        "idempotency_key": reference,
     }
     body = json.dumps(payload).encode()
     headers = {
         "Content-Type": "application/json",
-        "User-Agent": "garcar-payments/2.0",
-        "Idempotency-Key": payment["payment_reference"],
+        "User-Agent": "garcar-payments/2.1",
+        "Idempotency-Key": reference,
     }
     if FULFILLMENT_WEBHOOK_TOKEN:
         headers["Authorization"] = f"Bearer {FULFILLMENT_WEBHOOK_TOKEN}"
     try:
-        with urlopen(Request(FULFILLMENT_WEBHOOK_URL, data=body, headers=headers, method="POST"), timeout=10) as response:
-            ok = 200 <= response.status < 300
-            if not ok:
-                # Revert claim so Stripe redelivery can retry.
-                with _connect() as connection:
-                    connection.execute(
-                        "UPDATE payments SET status = 'PAID_PENDING_FULFILLMENT' WHERE payment_reference = ?",
-                        (payment["payment_reference"],),
-                    )
-            return ok
+        with urlopen(
+            Request(FULFILLMENT_WEBHOOK_URL, data=body, headers=headers, method="POST"),
+            timeout=10,
+        ) as response:
+            if not (200 <= response.status < 300):
+                release_notification(reference, token, f"HTTP_{response.status}")
+                return False
+        if complete_notification(reference, token):
+            return True
+        log("Delivery acknowledgment race: lease changed; manual reconciliation required")
+        return False
     except Exception as exc:
+        # Never write response bodies, URLs with query tokens, or credentials.
         log(f"Fulfillment notification failed: {type(exc).__name__}")
-        with _connect() as connection:
-            connection.execute(
-                "UPDATE payments SET status = 'PAID_PENDING_FULFILLMENT' WHERE payment_reference = ?",
-                (payment["payment_reference"],),
-            )
+        release_notification(reference, token, type(exc).__name__)
         return False
 
 
@@ -446,8 +545,8 @@ class Handler(BaseHTTPRequestHandler):
                     event_id = str(event.get("id") or "").strip()
                     with _connect() as connection:
                         row = connection.execute(
-                            "SELECT * FROM payments WHERE event_id = ? AND status = ? LIMIT 1",
-                            (event_id, "PAID_PENDING_FULFILLMENT"),
+                            "SELECT * FROM payments WHERE event_id = ? AND status IN (?, ?) LIMIT 1",
+                            (event_id, "PAID_PENDING_FULFILLMENT", "NOTIFICATION_IN_FLIGHT"),
                         ).fetchone()
                         if row:
                             pending = dict(row)
