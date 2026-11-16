@@ -14,7 +14,6 @@ from urllib.request import Request, urlopen
 
 PORT = int(os.environ.get("PORT", "8080"))
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
-ALLOW_UNVERIFIED_WEBHOOKS = os.environ.get("ALLOW_UNVERIFIED_WEBHOOKS", "false").lower() == "true"
 FULFILLMENT_WEBHOOK_URL = os.environ.get("FULFILLMENT_WEBHOOK_URL", "")
 FULFILLMENT_WEBHOOK_TOKEN = os.environ.get("FULFILLMENT_WEBHOOK_TOKEN", "")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
@@ -323,7 +322,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             self._json(200, {
                 "ok": True,
-                "webhook_verification": bool(STRIPE_WEBHOOK_SECRET) or ALLOW_UNVERIFIED_WEBHOOKS,
+                "webhook_verification": bool(STRIPE_WEBHOOK_SECRET),
                 "fulfillment_configured": bool(FULFILLMENT_WEBHOOK_URL),
                 "database": str(DB_PATH),
             })
@@ -346,16 +345,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         payload = self.rfile.read(length)
         signature = self.headers.get("Stripe-Signature", "")
-        if STRIPE_WEBHOOK_SECRET:
-            if not verify_stripe_signature(payload, signature, STRIPE_WEBHOOK_SECRET):
-                self._json(400, {"error": "invalid signature"})
-                return
-        elif not ALLOW_UNVERIFIED_WEBHOOKS:
+        if not STRIPE_WEBHOOK_SECRET:
             log("Webhook rejected: STRIPE_WEBHOOK_SECRET is not configured")
             self._json(503, {"error": "webhook verification not configured"})
             return
-        else:
-            log("WARNING: accepting unverified webhook because ALLOW_UNVERIFIED_WEBHOOKS=true")
+        if not verify_stripe_signature(payload, signature, STRIPE_WEBHOOK_SECRET):
+            self._json(400, {"error": "invalid signature"})
+            return
         try:
             event = json.loads(payload)
             if not isinstance(event, dict):
@@ -420,7 +416,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     init_db()
-    if not STRIPE_WEBHOOK_SECRET and not ALLOW_UNVERIFIED_WEBHOOKS:
+    if not STRIPE_WEBHOOK_SECRET:
         log("STRIPE_WEBHOOK_SECRET missing: health checks pass, but webhooks are rejected")
     log(f"Garcar Payments v2 listening on 0.0.0.0:{PORT}; database={DB_PATH}")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
