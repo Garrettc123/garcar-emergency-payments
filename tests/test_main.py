@@ -82,6 +82,32 @@ class PaymentReceiverTests(unittest.TestCase):
         event["data"]["object"]["payment_status"] = "unpaid"
         self.assertIsNone(main.extract_payment(event))
 
+    def test_metrics_authorization_fails_closed(self):
+        previous = main.METRICS_READ_TOKEN
+        try:
+            main.METRICS_READ_TOKEN = ""
+            self.assertFalse(main.metrics_authorized("Bearer any"))
+            main.METRICS_READ_TOKEN = "private-token-value"
+            self.assertFalse(main.metrics_authorized(""))
+            self.assertFalse(main.metrics_authorized("Bearer wrong"))
+            self.assertTrue(main.metrics_authorized("Bearer private-token-value"))
+        finally:
+            main.METRICS_READ_TOKEN = previous
+
+    def test_currency_totals_are_never_mixed(self):
+        usd = self.checkout_event("evt_usd")
+        payload = json.dumps(usd).encode()
+        main.record_event(usd, payload)
+        eur = self.checkout_event("evt_eur")
+        eur["data"]["object"]["payment_intent"] = "pi_eur"
+        eur["data"]["object"]["currency"] = "eur"
+        main.record_event(eur, json.dumps(eur).encode())
+        totals = main.aggregate_revenue()
+        self.assertEqual(totals["paid_events"], 2)
+        self.assertIsNone(totals["gross_collected_minor"])
+        self.assertEqual(totals["by_currency"]["usd"]["gross_collected_minor"], 4700)
+        self.assertEqual(totals["by_currency"]["eur"]["gross_collected_minor"], 4700)
+
 
 if __name__ == "__main__":
     unittest.main()
