@@ -114,6 +114,78 @@ class PaymentReceiverTests(unittest.TestCase):
         payment = main.extract_payment(event)
         self.assertEqual(payment["status"], "PAID_MANUAL_REVIEW")
 
+    def test_notification_lease_and_stale_claim_protection(self):
+        event = self.checkout_event("evt_claim")
+        event["data"]["object"]["metadata"] = {"sku": "GAR-REVIEW-497"}
+        event["data"]["object"]["payment_intent"] = "pi_claim"
+        _, payment = main.record_event(event, json.dumps(event).encode())
+        first = main.claim_notification(payment["payment_reference"], now=1000)
+        self.assertIsNotNone(first)
+        self.assertIsNone(main.claim_notification(payment["payment_reference"], now=1001))
+        replacement = main.claim_notification(payment["payment_reference"], now=1121)
+        self.assertIsNotNone(replacement)
+        self.assertNotEqual(first, replacement)
+        self.assertFalse(main.complete_notification(payment["payment_reference"], first))
+        self.assertFalse(main.release_notification(payment["payment_reference"], first, "stale"))
+        self.assertTrue(main.complete_notification(payment["payment_reference"], replacement))
+        self.assertTrue(main.notification_accepted(payment["payment_reference"]))
+        self.assertIsNone(main.claim_notification(payment["payment_reference"], now=2000))
+
+    def test_failed_notification_releases_for_retry(self):
+        event = self.checkout_event("evt_release")
+        event["data"]["object"]["metadata"] = {"sku": "GAR-REVIEW-497"}
+        event["data"]["object"]["payment_intent"] = "pi_release"
+        _, payment = main.record_event(event, json.dumps(event).encode())
+        first = main.claim_notification(payment["payment_reference"], now=10)
+        self.assertTrue(main.release_notification(payment["payment_reference"], first, "HTTP_503"))
+        second = main.claim_notification(payment["payment_reference"], now=11)
+        self.assertIsNotNone(second)
+        self.assertNotEqual(first, second)
+
+    def test_manual_review_cannot_be_leased(self):
+        event = self.checkout_event("evt_manual_hold")
+        event["data"]["object"]["payment_intent"] = "pi_manual_hold"
+        event["data"]["object"]["amount_total"] = 49700
+        _, payment = main.record_event(event, json.dumps(event).encode())
+        self.assertEqual(payment["status"], "PAID_MANUAL_REVIEW")
+        self.assertIsNone(main.claim_notification(payment["payment_reference"], now=100))
+
+    def test_legacy_unconfirmed_notification_requires_reconciliation(self):
+        event = self.checkout_event("evt_old")
+        event["data"]["object"]["metadata"] = {"sku": "GAR-REVIEW-497"}
+        event["data"]["object"]["payment_intent"] = "pi_old"
+        _, payment = main.record_event(event, json.dumps(event).encode())
+        with main._connect() as db:
+            db.execute(
+                "UPDATE payments SET status = 'FULFILLMENT_NOTIFIED' WHERE payment_reference = ?",
+                (payment["payment_reference"],),
+            )
+        main.init_db()
+        with main._connect() as db:
+            status = db.execute(
+                "SELECT status FROM payments WHERE payment_reference = ?",
+                (payment["payment_reference"],),
+            ).fetchone()["status"]
+        self.assertEqual(status, "DELIVERY_RECONCILIATION_REQUIRED")
+        self.assertIsNone(main.claim_notification(payment["payment_reference"], now=100))
+
+    def test_claim_retry_budget_exhaustion(self):
+        event = self.checkout_event("evt_exhaust")
+        event["data"]["object"]["metadata"] = {"sku": "GAR-REVIEW-497"}
+        event["data"]["object"]["payment_intent"] = "pi_exhaust"
+        _, payment = main.record_event(event, json.dumps(event).encode())
+        reference = payment["payment_reference"]
+        for i in range(main.MAX_NOTIFICATION_ATTEMPTS):
+            token = main.claim_notification(reference, now=100 + i)
+            self.assertTrue(token)
+            self.assertTrue(main.release_notification(reference, token, "HTTP_502"))
+        self.assertIsNone(main.claim_notification(reference, now=10000))
+        with main._connect() as db:
+            state = db.execute(
+                "SELECT status FROM payments WHERE payment_reference = ?", (reference,)
+            ).fetchone()["status"]
+        self.assertEqual(state, "DELIVERY_MANUAL_INTERVENTION")
+
     def test_unpaid_checkout_is_not_queued(self):
         event = self.checkout_event("evt_unpaid")
         event["data"]["object"]["payment_status"] = "unpaid"
