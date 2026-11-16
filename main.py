@@ -157,6 +157,12 @@ def resolve_offer(obj: dict, amount_minor: int) -> dict:
     }
 
 
+def requires_manual_review(payment: dict) -> bool:
+    """An unattributed receipt is not an authorization to fulfill an arbitrary product."""
+    sku = str(payment.get("sku") or "").strip()
+    return not sku or sku == "metadata-offer" or sku.startswith("manual-review-")
+
+
 def extract_payment(event: dict) -> dict | None:
     event_type = str(event.get("type") or "")
     if event_type not in FULFILLABLE_EVENTS:
@@ -194,7 +200,7 @@ def extract_payment(event: dict) -> dict | None:
         "fulfill_hours": offer["fulfill_hours"],
         "session_id": str(obj.get("id") or ""),
         "recurring": 1 if recurring else 0,
-        "status": "PAID_PENDING_FULFILLMENT",
+        "status": "PAID_MANUAL_REVIEW" if requires_manual_review(offer) else "PAID_PENDING_FULFILLMENT",
         "created_at": utc_now(),
         "metadata_json": json.dumps(_metadata(obj), sort_keys=True),
     }
@@ -248,6 +254,10 @@ def mark_fulfillment_notified(payment_reference: str) -> bool:
 
 
 def notify_fulfillment(payment: dict) -> bool:
+    # A valid receipt does not establish which product should be delivered.
+    if requires_manual_review(payment):
+        log("Fulfillment held: payment requires manual offer attribution")
+        return False
     if not FULFILLMENT_WEBHOOK_URL:
         return False
     if not FULFILLMENT_WEBHOOK_URL.startswith("https://"):
@@ -454,8 +464,18 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._json(200, {"received": True, "duplicate": True})
             return
-        notified = notify_fulfillment(payment) if payment else False
+        notified = notify_fulfillment(payment) if payment and not requires_manual_review(payment) else False
         if payment:
+            if requires_manual_review(payment):
+                log(f"PAYMENT HELD for offer attribution reference={payment['payment_reference']}")
+                self._json(200, {
+                    "received": True,
+                    "payment_queued": True,
+                    "fulfillment_notified": False,
+                    "fulfillment_held": True,
+                    "reason": "manual_offer_attribution",
+                })
+                return
             log(f"PAYMENT QUEUED reference={payment['payment_reference']} sku={payment['sku']} amount_minor={payment['amount_minor']}")
             if FULFILLMENT_WEBHOOK_URL and not notified:
                 # Return non-2xx so Stripe retries; payment row already persisted.
