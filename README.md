@@ -9,12 +9,12 @@ The earlier emergency receiver could accept unsigned webhooks when the signing s
 ## Production behavior
 
 - Rejects webhooks unless `STRIPE_WEBHOOK_SECRET` is configured.
-- Allows unsigned events only when `ALLOW_UNVERIFIED_WEBHOOKS=true` is explicitly set for local testing.
+- Always rejects unsigned webhooks, even when a legacy testing flag is set.
 - Verifies Stripe `v1` signatures and rejects stale timestamps.
 - Stores Stripe event IDs and payment references in SQLite with uniqueness constraints.
 - Ignores duplicate deliveries and unpaid Checkout sessions.
 - Uses Stripe metadata to disambiguate offers; an untagged `$497` purchase enters manual review.
-- Supports an optional HTTPS fulfillment webhook.
+- Supports an optional HTTPS fulfillment webhook only with a configured bearer authentication token.
 - Reports collected amounts without mislabeling them as authoritative MRR.
 
 ## Required environment
@@ -33,13 +33,7 @@ FULFILLMENT_WEBHOOK_URL=https://your-secure-automation.example/webhook
 FULFILLMENT_WEBHOOK_TOKEN=replace-with-a-long-secret
 ```
 
-Local unsigned testing only:
-
-```env
-ALLOW_UNVERIFIED_WEBHOOKS=true
-```
-
-Never enable that flag in production.
+All tests, including local development, must use correctly signed Stripe test events. The old `ALLOW_UNVERIFIED_WEBHOOKS` flag is ignored by the code.
 
 ## Run
 
@@ -115,7 +109,7 @@ Garrett Carrol · Grandview / Kopperl, Texas
 - GET `/health` is public liveness and does not expose storage paths or revenue.
 - GET `/readyz` returns HTTP 503 until the signed-webhook receiver and database are ready; configure Railway's healthcheck path to `/readyz` after rollout.
 - GET `/revenue` and `/mrr` now require `Authorization: Bearer <METRICS_READ_TOKEN>`; without the variable the endpoint fails closed with HTTP 503.
-- Unsigned webhook testing requires both `GARCAR_ENV=development` and `ALLOW_UNVERIFIED_WEBHOOKS=true`, outside Railway. No production unsigned bypass.
+- Unsigned webhook intake is prohibited in every environment. Use the test signing secret and Stripe CLI or locally signed test fixtures.
 - Cross-currency totals appear in `by_currency`. A global minor-unit gross is `null` when multiple currencies exist.
 
 Before merging or deploying this change, provision a distinct, strong `METRICS_READ_TOKEN` on the payment receiver and update any authorized metrics consumers. Do not log or share its value. This PR does not alter the currently deployed production endpoint.
