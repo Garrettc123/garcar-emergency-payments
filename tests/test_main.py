@@ -1,4 +1,7 @@
 import hashlib
+import io
+import os
+from unittest.mock import patch
 import hmac
 import json
 import tempfile
@@ -39,6 +42,35 @@ class PaymentReceiverTests(unittest.TestCase):
         header = f"t={timestamp},v1={signature}"
         self.assertTrue(main.verify_stripe_signature(payload, header, "whsec_test", now=timestamp))
         self.assertFalse(main.verify_stripe_signature(payload, header, "wrong", now=timestamp))
+
+    def test_unverified_webhooks_are_always_rejected(self):
+        # An old Railway testing variable must never authorize unsigned money events.
+        payload = json.dumps({**self.checkout_event(), "livemode": True}).encode()
+        handler = object.__new__(main.Handler)
+        handler.path = "/stripe-webhook"
+        handler.headers = {"Content-Length": str(len(payload))}
+        handler.rfile = io.BytesIO(payload)
+        responses = []
+        handler._json = lambda status, body: responses.append((status, body))
+        with patch.object(main, "STRIPE_WEBHOOK_SECRET", ""), patch.dict(
+            os.environ, {"ALLOW_UNVERIFIED_WEBHOOKS": "true"}
+        ):
+            handler.do_POST()
+        self.assertEqual(responses[0][0], 503)
+        self.assertEqual(main.aggregate_revenue()["paid_events"], 0)
+
+    def test_bad_signature_does_not_record_payment(self):
+        payload = json.dumps({**self.checkout_event(), "livemode": True}).encode()
+        handler = object.__new__(main.Handler)
+        handler.path = "/stripe-webhook"
+        handler.headers = {"Content-Length": str(len(payload)), "Stripe-Signature": "bad"}
+        handler.rfile = io.BytesIO(payload)
+        responses = []
+        handler._json = lambda status, body: responses.append((status, body))
+        with patch.object(main, "STRIPE_WEBHOOK_SECRET", "whsec_test"):
+            handler.do_POST()
+        self.assertEqual(responses[0][0], 400)
+        self.assertEqual(main.aggregate_revenue()["paid_events"], 0)
 
     def test_idempotent_event_and_payment(self):
         event = self.checkout_event()
