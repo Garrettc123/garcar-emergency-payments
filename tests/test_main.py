@@ -59,6 +59,7 @@ class PaymentReceiverTests(unittest.TestCase):
         event["data"]["object"]["amount_total"] = 250000
         payment = main.extract_payment(event)
         self.assertEqual(payment["sku"], "manual-review-unattributed")
+        self.assertEqual(payment["status"], "PAID_MANUAL_REVIEW")
 
     def test_ambiguous_497_requires_manual_review(self):
         event = self.checkout_event("evt_497")
@@ -66,6 +67,7 @@ class PaymentReceiverTests(unittest.TestCase):
         event["data"]["object"]["amount_total"] = 49700
         payment = main.extract_payment(event)
         self.assertEqual(payment["sku"], "manual-review-497")
+        self.assertEqual(payment["status"], "PAID_MANUAL_REVIEW")
 
     def test_metadata_disambiguates_offer(self):
         event = self.checkout_event("evt_meta")
@@ -76,6 +78,41 @@ class PaymentReceiverTests(unittest.TestCase):
         payment = main.extract_payment(event)
         self.assertEqual(payment["sku"], "workflow-sprint-497")
         self.assertEqual(payment["fulfill_hours"], 24)
+
+    def test_unattributed_payment_never_dispatches(self):
+        from unittest.mock import patch
+
+        event = self.checkout_event("evt_attribution_hold")
+        event["data"]["object"]["payment_intent"] = "pi_attribution_hold"
+        event["data"]["object"]["amount_total"] = 49700
+        inserted, payment = main.record_event(event, json.dumps(event).encode())
+        self.assertTrue(inserted)
+        self.assertEqual(payment["status"], "PAID_MANUAL_REVIEW")
+        with patch.object(main, "FULFILLMENT_WEBHOOK_URL", "https://example.invalid/notify"):
+            with patch.object(main, "urlopen", side_effect=AssertionError("MUST NOT send")):
+                self.assertFalse(main.notify_fulfillment(payment))
+        with main._connect() as connection:
+            row = connection.execute(
+                "SELECT status FROM payments WHERE payment_reference = ?",
+                ("pi_attribution_hold",),
+            ).fetchone()
+        self.assertEqual(row["status"], "PAID_MANUAL_REVIEW")
+
+    def test_known_sku_can_be_fulfilled(self):
+        event = self.checkout_event("evt_known")
+        event["data"]["object"]["metadata"] = {
+            "sku": "GAR-REVIEW-497",
+            "offer_name": "Lead Follow-Up Review",
+        }
+        payment = main.extract_payment(event)
+        self.assertEqual(payment["status"], "PAID_PENDING_FULFILLMENT")
+        self.assertFalse(main.requires_manual_review(payment))
+
+    def test_name_only_metadata_requires_manual_review(self):
+        event = self.checkout_event("evt_name_only")
+        event["data"]["object"]["metadata"] = {"offer_name": "Unknown"}
+        payment = main.extract_payment(event)
+        self.assertEqual(payment["status"], "PAID_MANUAL_REVIEW")
 
     def test_unpaid_checkout_is_not_queued(self):
         event = self.checkout_event("evt_unpaid")
