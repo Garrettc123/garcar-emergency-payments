@@ -1,4 +1,7 @@
 import hashlib
+import io
+import os
+from unittest.mock import patch
 import hmac
 import json
 import tempfile
@@ -39,6 +42,55 @@ class PaymentReceiverTests(unittest.TestCase):
         header = f"t={timestamp},v1={signature}"
         self.assertTrue(main.verify_stripe_signature(payload, header, "whsec_test", now=timestamp))
         self.assertFalse(main.verify_stripe_signature(payload, header, "wrong", now=timestamp))
+
+
+    def test_legacy_unsigned_bypass_never_accepts_live_money_event(self):
+        event = self.checkout_event("evt_unsigned")
+        event["livemode"] = True
+        payload = json.dumps(event).encode()
+        handler = object.__new__(main.Handler)
+        handler.path = "/stripe-webhook"
+        handler.headers = {"Content-Length": str(len(payload))}
+        handler.rfile = io.BytesIO(payload)
+        responses = []
+        handler._json = lambda status, body: responses.append((status, body))
+        with patch.object(main, "STRIPE_WEBHOOK_SECRET", ""), patch.dict(
+            os.environ, {"ALLOW_UNVERIFIED_WEBHOOKS": "true", "GARCAR_ENV": "development"}
+        ):
+            handler.do_POST()
+        self.assertEqual(responses[0][0], 503)
+        self.assertEqual(main.aggregate_revenue()["paid_events"], 0)
+
+    def test_invalid_webhook_signature_cannot_record_a_payment(self):
+        event = self.checkout_event("evt_wrong_sig")
+        event["livemode"] = True
+        payload = json.dumps(event).encode()
+        handler = object.__new__(main.Handler)
+        handler.path = "/stripe-webhook"
+        handler.headers = {"Content-Length": str(len(payload)), "Stripe-Signature": "wrong"}
+        handler.rfile = io.BytesIO(payload)
+        responses = []
+        handler._json = lambda status, body: responses.append((status, body))
+        with patch.object(main, "STRIPE_WEBHOOK_SECRET", "whsec_test"):
+            handler.do_POST()
+        self.assertEqual(responses[0][0], 400)
+        self.assertEqual(main.aggregate_revenue()["paid_events"], 0)
+
+    def test_fulfillment_notification_requires_authentication_token(self):
+        event = self.checkout_event("evt_no_callback_auth")
+        event["data"]["object"]["metadata"] = {"sku": "GAR-REVIEW-497"}
+        event["data"]["object"]["payment_intent"] = "pi_no_callback_auth"
+        _, payment = main.record_event(event, json.dumps(event).encode())
+        with patch.object(main, "FULFILLMENT_WEBHOOK_URL", "https://example.invalid/notify"), patch.object(
+            main, "FULFILLMENT_WEBHOOK_TOKEN", ""
+        ), patch.object(main, "urlopen", side_effect=AssertionError("MUST NOT send")):
+            self.assertFalse(main.notify_fulfillment(payment))
+        with main._connect() as db:
+            status = db.execute(
+                "SELECT status FROM payments WHERE payment_reference = ?",
+                ("pi_no_callback_auth",),
+            ).fetchone()["status"]
+        self.assertEqual(status, "PAID_PENDING_FULFILLMENT")
 
     def test_idempotent_event_and_payment(self):
         event = self.checkout_event()
