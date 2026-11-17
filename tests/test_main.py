@@ -5,9 +5,13 @@ from unittest.mock import patch
 import hmac
 import json
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
+from http.server import ThreadingHTTPServer
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 import main
 
@@ -91,6 +95,59 @@ class PaymentReceiverTests(unittest.TestCase):
                 ("pi_no_callback_auth",),
             ).fetchone()["status"]
         self.assertEqual(status, "PAID_PENDING_FULFILLMENT")
+
+    def test_local_http_signed_replay_and_invalid_signature(self):
+        # Real HTTP handler and SQLite writes, with a local ephemeral listener.
+        # This test sends no request to Stripe or production infrastructure.
+        event = self.checkout_event("evt_http_signed")
+        event["livemode"] = True
+        event["data"]["object"]["payment_intent"] = "pi_http_signed"
+        event["data"]["object"]["metadata"] = {"sku": "GAR-REVIEW-497"}
+        payload = json.dumps(event).encode()
+        secret = "whsec_local_ci_only"
+        timestamp = int(time.time())
+        signature = hmac.new(
+            secret.encode(), f"{timestamp}.".encode() + payload,
+            hashlib.sha256
+        ).hexdigest()
+        signed_header = f"t={timestamp},v1={signature}"
+        with patch.object(main, "STRIPE_WEBHOOK_SECRET", secret), patch.object(
+            main, "FULFILLMENT_WEBHOOK_URL", ""
+        ), ThreadingHTTPServer(("127.0.0.1", 0), main.Handler) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            url = f"http://127.0.0.1:{server.server_port}/stripe-webhook"
+            try:
+                def send(signature_header):
+                    request = Request(
+                        url, data=payload,
+                        headers={"Content-Type": "application/json",
+                                 "Stripe-Signature": signature_header},
+                        method="POST",
+                    )
+                    with urlopen(request, timeout=5) as response:
+                        self.assertEqual(response.status, 200)
+                        return json.loads(response.read())
+
+                first = send(signed_header)
+                self.assertTrue(first["payment_queued"])
+                duplicate = send(signed_header)
+                self.assertTrue(duplicate["duplicate"])
+                with self.assertRaises(HTTPError) as raised:
+                    send(f"t={timestamp},v1={'0' * 64}")
+                self.assertEqual(raised.exception.code, 400)
+
+                with main._connect() as db:
+                    self.assertEqual(db.execute(
+                        "SELECT COUNT(*) FROM payments"
+                    ).fetchone()[0], 1)
+                    self.assertEqual(db.execute(
+                        "SELECT COUNT(*) FROM stripe_events"
+                    ).fetchone()[0], 1)
+                self.assertEqual(main.aggregate_revenue()["paid_events"], 1)
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
 
     def test_idempotent_event_and_payment(self):
         event = self.checkout_event()
