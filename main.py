@@ -229,13 +229,12 @@ def record_event(event: dict, payload: bytes) -> tuple[bool, dict | None]:
     return True, payment
 
 
-def mark_fulfillment_notified(payment_reference: str) -> bool:
-    """Atomically transition a pending payment to FULFILLMENT_NOTIFIED. Returns True if claimed."""
+def reserve_fulfillment_attempt(payment_reference: str) -> bool:
+    """Claim one handoff attempt; crash never falsely marks it delivered."""
     with _connect() as connection:
         cursor = connection.execute(
             """
-            UPDATE payments
-            SET status = 'FULFILLMENT_NOTIFIED'
+            UPDATE payments SET status = 'FULFILLMENT_ATTEMPTING'
             WHERE payment_reference = ? AND status = 'PAID_PENDING_FULFILLMENT'
             """,
             (payment_reference,),
@@ -243,16 +242,55 @@ def mark_fulfillment_notified(payment_reference: str) -> bool:
         return cursor.rowcount == 1
 
 
+def finish_fulfillment_attempt(payment_reference: str, *, confirmed: bool) -> None:
+    """Unknown outcomes require reconciliation; never retry blindly."""
+    status = "FULFILLMENT_NOTIFIED" if confirmed else "FULFILLMENT_OUTCOME_UNKNOWN"
+    with _connect() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE payments SET status = ?
+            WHERE payment_reference = ? AND status = 'FULFILLMENT_ATTEMPTING'
+            """,
+            (status, payment_reference),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("fulfillment state transition lost or already consumed")
+
+
+def fulfillment_summary() -> dict:
+    """No PII; status counts for manual reconciliation and monitoring."""
+    with _connect() as connection:
+        rows = connection.execute(
+            "SELECT status, COUNT(*) AS count FROM payments GROUP BY status"
+        ).fetchall()
+    counts = {row["status"]: row["count"] for row in rows}
+    return {
+        "paid_pending_fulfillment": counts.get("PAID_PENDING_FULFILLMENT", 0),
+        "fulfillment_attempting": counts.get("FULFILLMENT_ATTEMPTING", 0),
+        "fulfillment_outcome_unknown": counts.get("FULFILLMENT_OUTCOME_UNKNOWN", 0),
+        "fulfillment_notified": counts.get("FULFILLMENT_NOTIFIED", 0),
+        "no_customer_identifiers": True,
+        "note": "Notification does not mean service was delivered; reconcile unknown outcomes before retry.",
+    }
+
+
 def notify_fulfillment(payment: dict) -> bool:
     if not FULFILLMENT_WEBHOOK_URL:
         return False
-    if not FULFILLMENT_WEBHOOK_URL.startswith("https://"):
-        log("FULFILLMENT_WEBHOOK_URL rejected: HTTPS is required")
+    try:
+        target = urlparse(FULFILLMENT_WEBHOOK_URL)
+        if (target.scheme != "https" or not target.hostname
+                or target.username is not None or target.password is not None
+                or target.hostname.lower() in {"localhost", "127.0.0.1", "::1"}
+                or target.fragment):
+            log("Fulfillment target rejected: must be a nonlocal HTTPS endpoint")
+            return False
+    except ValueError:
+        log("Fulfillment target rejected: invalid URL")
         return False
-    # Claim first so concurrent/redelivered events cannot double-notify.
-    if not mark_fulfillment_notified(payment["payment_reference"]):
-        log(f"Fulfillment already claimed or not pending: {payment['payment_reference']}")
-        return True  # Treat as success; already handled.
+    if not reserve_fulfillment_attempt(payment["payment_reference"]):
+        log("Fulfillment already attempted; requires state reconciliation before resending")
+        return False
     payload = {
         "event": "garcar.payment.received",
         "payment_reference": payment["payment_reference"],
@@ -268,30 +306,26 @@ def notify_fulfillment(payment: dict) -> bool:
     body = json.dumps(payload).encode()
     headers = {
         "Content-Type": "application/json",
-        "User-Agent": "garcar-payments/2.0",
+        "User-Agent": "garcar-payments/2.1",
         "Idempotency-Key": payment["payment_reference"],
     }
     if FULFILLMENT_WEBHOOK_TOKEN:
         headers["Authorization"] = f"Bearer {FULFILLMENT_WEBHOOK_TOKEN}"
+    confirmed = False
     try:
-        with urlopen(Request(FULFILLMENT_WEBHOOK_URL, data=body, headers=headers, method="POST"), timeout=10) as response:
-            ok = 200 <= response.status < 300
-            if not ok:
-                # Revert claim so Stripe redelivery can retry.
-                with _connect() as connection:
-                    connection.execute(
-                        "UPDATE payments SET status = 'PAID_PENDING_FULFILLMENT' WHERE payment_reference = ?",
-                        (payment["payment_reference"],),
-                    )
-            return ok
+        with urlopen(
+            Request(FULFILLMENT_WEBHOOK_URL, data=body, headers=headers, method="POST"),
+            timeout=10,
+        ) as response:
+            confirmed = 200 <= response.status < 300
     except Exception as exc:
-        log(f"Fulfillment notification failed: {type(exc).__name__}")
-        with _connect() as connection:
-            connection.execute(
-                "UPDATE payments SET status = 'PAID_PENDING_FULFILLMENT' WHERE payment_reference = ?",
-                (payment["payment_reference"],),
-            )
-        return False
+        # Network timeout, reset, non-2xx HTTP: the remote side might still
+        # have applied the action. Failing open and auto-retrying could
+        # duplicate client fulfillment.
+        log(f"Fulfillment notification outcome unknown: {type(exc).__name__}")
+    finally:
+        finish_fulfillment_attempt(payment["payment_reference"], confirmed=confirmed)
+    return confirmed
 
 
 def aggregate_revenue() -> dict:
@@ -346,6 +380,8 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif path in ("/revenue", "/mrr"):
             self._json(200, aggregate_revenue())
+        elif path == "/fulfillment-status":
+            self._json(200, fulfillment_summary())
         else:
             self._json(404, {"error": "not found"})
 
