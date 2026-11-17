@@ -14,7 +14,9 @@ from urllib.request import Request, urlopen
 
 PORT = int(os.environ.get("PORT", "8080"))
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
-ALLOW_UNVERIFIED_WEBHOOKS = os.environ.get("ALLOW_UNVERIFIED_WEBHOOKS", "false").lower() == "true"
+NOTIFICATION_LEASE_SECONDS = 120
+MAX_NOTIFICATION_ATTEMPTS = 12
+METRICS_READ_TOKEN = os.environ.get("METRICS_READ_TOKEN", "")
 FULFILLMENT_WEBHOOK_URL = os.environ.get("FULFILLMENT_WEBHOOK_URL", "")
 FULFILLMENT_WEBHOOK_TOKEN = os.environ.get("FULFILLMENT_WEBHOOK_TOKEN", "")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
@@ -77,7 +79,48 @@ def init_db() -> None:
                 FOREIGN KEY(event_id) REFERENCES stripe_events(event_id)
             );
             CREATE INDEX IF NOT EXISTS idx_payments_created_at ON payments(created_at);
+            -- Keep aliases without rewriting or destroying historic payment records.
+            -- This table records when a newly paid invoice corresponds to a
+            -- payment reference already persisted by the pre-upgrade receiver.
+            CREATE TABLE IF NOT EXISTS payment_receipt_aliases (
+                invoice_reference TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                legacy_reference TEXT NOT NULL,
+                reconciliation_state TEXT NOT NULL,
+                invoice_amount_minor INTEGER NOT NULL,
+                currency TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(event_id) REFERENCES stripe_events(event_id),
+                FOREIGN KEY(legacy_reference) REFERENCES payments(payment_reference)
+            );
             """
+        )
+        # Existing production volumes retain all payment evidence. Add lease
+        # columns incrementally; never drop/recreate the payments table.
+        existing = {
+            row["name"] for row in connection.execute("PRAGMA table_info(payments)")
+        }
+        additions = {
+            "delivery_claim_token": "TEXT",
+            "delivery_claim_until": "INTEGER",
+            "delivery_attempts": "INTEGER NOT NULL DEFAULT 0",
+            "delivery_accepted_at": "TEXT",
+            "delivery_last_error": "TEXT",
+        }
+        for name, declaration in additions.items():
+            if name not in existing:
+                connection.execute(f"ALTER TABLE payments ADD COLUMN {name} {declaration}")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_payment_delivery_state "
+            "ON payments(status, delivery_claim_until)"
+        )
+        # Old versions marked FULFILLMENT_NOTIFIED BEFORE actually sending.
+        # They are ambiguous: do not resend or silently treat as delivered.
+        connection.execute(
+            """UPDATE payments
+               SET status = 'DELIVERY_RECONCILIATION_REQUIRED'
+               WHERE status = 'FULFILLMENT_NOTIFIED'
+                 AND delivery_accepted_at IS NULL"""
         )
 
 
@@ -115,9 +158,45 @@ def _safe_int(value, default: int = 0) -> int:
         return default
 
 
+def metrics_authorized(authorization: str) -> bool:
+    """Fail closed when no private metrics token has been provisioned."""
+    return bool(METRICS_READ_TOKEN) and hmac.compare_digest(
+        authorization, f"Bearer {METRICS_READ_TOKEN}"
+    )
+
+
+def _invoice_is_recurring(obj: dict) -> bool:
+    """Recognize both modern and legacy Stripe subscription invoice shapes."""
+    parent = obj.get("parent")
+    if isinstance(parent, dict) and parent.get("type") == "subscription_details":
+        return True
+    if obj.get("subscription"):
+        return True
+    return str(obj.get("billing_reason") or "").startswith("subscription_")
+
+
 def _metadata(obj: dict) -> dict:
-    raw = obj.get("metadata") or {}
-    return raw if isinstance(raw, dict) else {}
+    """Use Stripe's immutable subscription metadata snapshot when present.
+
+    An invoice can have empty top-level metadata even when its subscription
+    identifies a product. Conflicting explicit SKUs require manual attribution.
+    """
+    direct = obj.get("metadata") or {}
+    direct = direct if isinstance(direct, dict) else {}
+    snapshot = {}
+    if _invoice_is_recurring(obj):
+        parent = obj.get("parent")
+        if isinstance(parent, dict) and parent.get("type") == "subscription_details":
+            details = parent.get("subscription_details") or {}
+        else:
+            details = obj.get("subscription_details") or {}
+        if isinstance(details, dict) and isinstance(details.get("metadata"), dict):
+            snapshot = details["metadata"]
+    direct_sku = str(direct.get("sku") or direct.get("offer_id") or "").strip()
+    snapshot_sku = str(snapshot.get("sku") or snapshot.get("offer_id") or "").strip()
+    if direct_sku and snapshot_sku and direct_sku != snapshot_sku:
+        return {"sku": "manual-review-conflicting-sku"}
+    return {**snapshot, **direct}
 
 
 def resolve_offer(obj: dict, amount_minor: int) -> dict:
@@ -144,6 +223,12 @@ def resolve_offer(obj: dict, amount_minor: int) -> dict:
     }
 
 
+def requires_manual_review(payment: dict) -> bool:
+    """An unattributed receipt is not an authorization to fulfill an arbitrary product."""
+    sku = str(payment.get("sku") or "").strip()
+    return not sku or sku == "metadata-offer" or sku.startswith("manual-review-")
+
+
 def extract_payment(event: dict) -> dict | None:
     event_type = str(event.get("type") or "")
     if event_type not in FULFILLABLE_EVENTS:
@@ -152,23 +237,36 @@ def extract_payment(event: dict) -> dict | None:
     if not isinstance(obj, dict):
         return None
     if event_type.startswith("checkout.session"):
+        # Subscription Checkouts and their first paid invoice describe the
+        # same collection. Let invoice.paid be the sole subscription receipt
+        # to prevent double-counting and duplicate fulfillment notifications.
+        # One-time Checkout sessions continue through the normal paid gate.
+        if str(obj.get("mode") or "").lower() == "subscription":
+            return None
         if str(obj.get("payment_status") or "").lower() != "paid":
             return None
         amount_minor = _safe_int(obj.get("amount_total"))
         currency = str(obj.get("currency") or "usd").lower()
         customer_email = ((obj.get("customer_details") or {}).get("email") or obj.get("customer_email") or "")
-        payment_intent = str(obj.get("payment_intent") or obj.get("id") or "")
+        # For one-time Checkout, the payment intent identifies the collection;
+        # a Checkout session ID is a stable fallback if the intent is absent.
+        payment_reference = str(obj.get("payment_intent") or obj.get("id") or "").strip()
         recurring = False
     else:  # invoice.paid
         amount_minor = _safe_int(obj.get("amount_paid"))
         currency = str(obj.get("currency") or "usd").lower()
         customer_email = str(obj.get("customer_email") or "")
-        payment_intent = str(obj.get("payment_intent") or obj.get("id") or "")
-        recurring = True
-    if amount_minor <= 0:
+        # Invoice IDs are stable across different Stripe Event IDs (and do
+        # not change with webhook redelivery or invoice payment shapes).
+        # Do not fall back to an event ID or a payment_intent for invoice
+        # deduplication: those can count the same invoice more than once.
+        invoice_id = str(obj.get("id") or "").strip()
+        payment_reference = f"invoice:{invoice_id}" if invoice_id else ""
+        # Not every paid invoice is a recurring subscription collection.
+        recurring = _invoice_is_recurring(obj)
+    if amount_minor <= 0 or not payment_reference:
         return None
     offer = resolve_offer(obj, amount_minor)
-    payment_reference = payment_intent or f"{event.get('id')}-{amount_minor}"
     return {
         "payment_reference": payment_reference,
         "event_id": str(event.get("id") or ""),
@@ -181,10 +279,97 @@ def extract_payment(event: dict) -> dict | None:
         "fulfill_hours": offer["fulfill_hours"],
         "session_id": str(obj.get("id") or ""),
         "recurring": 1 if recurring else 0,
-        "status": "PAID_PENDING_FULFILLMENT",
+        "status": "PAID_MANUAL_REVIEW" if requires_manual_review(offer) else "PAID_PENDING_FULFILLMENT",
         "created_at": utc_now(),
         "metadata_json": json.dumps(_metadata(obj), sort_keys=True),
     }
+
+
+def _invoice_payment_intent_ids(obj: dict) -> set[str]:
+    """Collect stable payment IDs from legacy and newer Stripe invoice shapes.
+
+    The newer invoice payments list can include failed attempts; only the
+    entries with paid status are eligible as evidence of the same collection.
+    """
+    ids: set[str] = set()
+    def add(value: object) -> None:
+        if isinstance(value, dict):
+            value = value.get("id")
+        if isinstance(value, str) and value.startswith("pi_"):
+            ids.add(value)
+
+    add(obj.get("payment_intent"))
+    payments = obj.get("payments")
+    if isinstance(payments, dict) and isinstance(payments.get("data"), list):
+        for entry in payments["data"][:100]:
+            if not isinstance(entry, dict) or entry.get("status") != "paid":
+                continue
+            payment = entry.get("payment")
+            if isinstance(payment, dict) and payment.get("type") == "payment_intent":
+                add(payment.get("payment_intent"))
+    return ids
+
+
+def _hold_legacy_invoice_alias(
+    connection: sqlite3.Connection, event: dict, payment: dict
+) -> bool:
+    """Prevent a historical payment-intent row being counted again as invoice:.
+
+    An exact amount/currency match is recorded as a linked alias; an ambiguous
+    collision is recorded as a reconciliation hold, not silently counted as
+    another collection. The event itself remains in stripe_events.
+    """
+    if event.get("type") != "invoice.paid":
+        return False
+    invoice_reference = payment["payment_reference"]
+    if not invoice_reference.startswith("invoice:"):
+        return False
+    if connection.execute(
+        "SELECT 1 FROM payment_receipt_aliases WHERE invoice_reference = ?",
+        (invoice_reference,),
+    ).fetchone():
+        return True
+    obj = (event.get("data") or {}).get("object") or {}
+    if not isinstance(obj, dict):
+        return False
+    ids = _invoice_payment_intent_ids(obj)
+    if not ids:
+        return False
+    linked = []
+    for payment_intent in sorted(ids):
+        row = connection.execute(
+            """SELECT payment_reference, amount_minor, currency
+               FROM payments WHERE payment_reference = ?""",
+            (payment_intent,),
+        ).fetchone()
+        if row:
+            linked.append(row)
+    if not linked:
+        return False
+    payments_list = obj.get("payments")
+    # New API snapshots can paginate invoice payments. Do not certify a
+    # one-payment match if the signed snapshot explicitly has more entries.
+    complete_list = not (
+        isinstance(payments_list, dict) and payments_list.get("has_more") is True
+    )
+    exact = (
+        complete_list
+        and len(ids) == 1
+        and len(linked) == 1
+        and linked[0]["amount_minor"] == payment["amount_minor"]
+        and linked[0]["currency"] == payment["currency"]
+    )
+    state = "MATCHED_LEGACY_RECEIPT" if exact else "MANUAL_RECONCILIATION"
+    connection.execute(
+        """INSERT OR IGNORE INTO payment_receipt_aliases(
+            invoice_reference, event_id, legacy_reference,
+            reconciliation_state, invoice_amount_minor, currency, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (invoice_reference, payment["event_id"], linked[0]["payment_reference"],
+         state, payment["amount_minor"], payment["currency"], utc_now()),
+    )
+    log(f"Invoice legacy receipt alias held state={state}")
+    return True
 
 
 def record_event(event: dict, payload: bytes) -> tuple[bool, dict | None]:
@@ -200,6 +385,10 @@ def record_event(event: dict, payload: bytes) -> tuple[bool, dict | None]:
         )
         if cursor.rowcount == 0:
             return False, None
+        if payment and _hold_legacy_invoice_alias(connection, event, payment):
+            # Existing paid PaymentIntent row is authoritative; never insert a
+            # second invoice row or deliver a second fulfillment notification.
+            payment = None
         if payment:
             payment_cursor = connection.execute(
                 """
@@ -220,33 +409,113 @@ def record_event(event: dict, payload: bytes) -> tuple[bool, dict | None]:
     return True, payment
 
 
-def mark_fulfillment_notified(payment_reference: str) -> bool:
-    """Atomically transition a pending payment to FULFILLMENT_NOTIFIED. Returns True if claimed."""
+def claim_notification(payment_reference: str, now: int | None = None) -> str | None:
+    """Lease one eligible payment; a crash leaves an expiring recoverable claim.
+
+    The compare-and-swap UPDATE prevents multiple receiver threads from sending
+    the same payment concurrently. The downstream endpoint must also dedupe
+    Idempotency-Key because failure after an HTTP 2xx may be ambiguous.
+    """
+    issued_at = int(time.time()) if now is None else now
+    token = os.urandom(16).hex()
     with _connect() as connection:
-        cursor = connection.execute(
+        changed = connection.execute(
             """
             UPDATE payments
-            SET status = 'FULFILLMENT_NOTIFIED'
-            WHERE payment_reference = ? AND status = 'PAID_PENDING_FULFILLMENT'
+               SET status = 'NOTIFICATION_IN_FLIGHT',
+                   delivery_claim_token = ?,
+                   delivery_claim_until = ?,
+                   delivery_attempts = delivery_attempts + 1
+             WHERE payment_reference = ?
+               AND delivery_attempts < ?
+               AND sku <> 'metadata-offer'
+               AND sku NOT LIKE 'manual-review-%'
+               AND TRIM(sku) <> ''
+               AND (
+                    status = 'PAID_PENDING_FULFILLMENT'
+                    OR (
+                        status = 'NOTIFICATION_IN_FLIGHT'
+                        AND delivery_claim_until IS NOT NULL
+                        AND delivery_claim_until <= ?
+                    )
+               )
             """,
-            (payment_reference,),
+            (token, issued_at + NOTIFICATION_LEASE_SECONDS,
+             payment_reference, MAX_NOTIFICATION_ATTEMPTS, issued_at),
         )
-        return cursor.rowcount == 1
+        return token if changed.rowcount == 1 else None
+
+
+def notification_accepted(payment_reference: str) -> bool:
+    with _connect() as connection:
+        row = connection.execute(
+            "SELECT status FROM payments WHERE payment_reference = ?",
+            (payment_reference,),
+        ).fetchone()
+    return bool(row and row["status"] == "NOTIFICATION_ACCEPTED")
+
+
+def complete_notification(payment_reference: str, token: str) -> bool:
+    """Persist explicit downstream HTTP acceptance, not customer fulfillment."""
+    with _connect() as connection:
+        updated = connection.execute(
+            """UPDATE payments
+               SET status = 'NOTIFICATION_ACCEPTED',
+                   delivery_accepted_at = ?,
+                   delivery_claim_token = NULL,
+                   delivery_claim_until = NULL,
+                   delivery_last_error = NULL
+               WHERE payment_reference = ?
+                 AND delivery_claim_token = ?
+                 AND status = 'NOTIFICATION_IN_FLIGHT'""",
+            (utc_now(), payment_reference, token),
+        )
+        return updated.rowcount == 1
+
+
+def release_notification(payment_reference: str, token: str, error_kind: str) -> bool:
+    """Only the active lease owner may release or exhaust a delivery claim."""
+    with _connect() as connection:
+        updated = connection.execute(
+            """UPDATE payments
+               SET status = CASE
+                   WHEN delivery_attempts >= ? THEN 'DELIVERY_MANUAL_INTERVENTION'
+                   ELSE 'PAID_PENDING_FULFILLMENT'
+               END,
+               delivery_claim_token = NULL,
+               delivery_claim_until = NULL,
+               delivery_last_error = ?
+               WHERE payment_reference = ?
+                 AND delivery_claim_token = ?
+                 AND status = 'NOTIFICATION_IN_FLIGHT'""",
+            (MAX_NOTIFICATION_ATTEMPTS, error_kind[:100], payment_reference, token),
+        )
+        return updated.rowcount == 1
 
 
 def notify_fulfillment(payment: dict) -> bool:
+    # This is an internal notification; the receiving service still needs
+    # explicit approval before any external outreach, charge or final delivery.
+    if requires_manual_review(payment):
+        log("Fulfillment held: payment requires manual offer attribution")
+        return False
     if not FULFILLMENT_WEBHOOK_URL:
         return False
     if not FULFILLMENT_WEBHOOK_URL.startswith("https://"):
         log("FULFILLMENT_WEBHOOK_URL rejected: HTTPS is required")
         return False
-    # Claim first so concurrent/redelivered events cannot double-notify.
-    if not mark_fulfillment_notified(payment["payment_reference"]):
-        log(f"Fulfillment already claimed or not pending: {payment['payment_reference']}")
-        return True  # Treat as success; already handled.
+    # Never transmit customer identifiers or payment metadata to an unauthenticated sink.
+    if not FULFILLMENT_WEBHOOK_TOKEN:
+        log("Fulfillment notification held: authentication token not configured")
+        return False
+    reference = payment["payment_reference"]
+    token = claim_notification(reference)
+    if not token:
+        # An in-flight (or exhausted) claim is NOT successful delivery.
+        return notification_accepted(reference)
     payload = {
         "event": "garcar.payment.received",
-        "payment_reference": payment["payment_reference"],
+        "payment_reference": reference,
         "customer_email": payment["customer_email"],
         "amount_minor": payment["amount_minor"],
         "currency": payment["currency"],
@@ -254,52 +523,78 @@ def notify_fulfillment(payment: dict) -> bool:
         "sku": payment["sku"],
         "fulfill_hours": payment["fulfill_hours"],
         "created_at": payment["created_at"],
-        "idempotency_key": payment["payment_reference"],
+        "idempotency_key": reference,
     }
     body = json.dumps(payload).encode()
     headers = {
         "Content-Type": "application/json",
-        "User-Agent": "garcar-payments/2.0",
-        "Idempotency-Key": payment["payment_reference"],
+        "User-Agent": "garcar-payments/2.1",
+        "Idempotency-Key": reference,
     }
     if FULFILLMENT_WEBHOOK_TOKEN:
         headers["Authorization"] = f"Bearer {FULFILLMENT_WEBHOOK_TOKEN}"
     try:
-        with urlopen(Request(FULFILLMENT_WEBHOOK_URL, data=body, headers=headers, method="POST"), timeout=10) as response:
-            ok = 200 <= response.status < 300
-            if not ok:
-                # Revert claim so Stripe redelivery can retry.
-                with _connect() as connection:
-                    connection.execute(
-                        "UPDATE payments SET status = 'PAID_PENDING_FULFILLMENT' WHERE payment_reference = ?",
-                        (payment["payment_reference"],),
-                    )
-            return ok
+        with urlopen(
+            Request(FULFILLMENT_WEBHOOK_URL, data=body, headers=headers, method="POST"),
+            timeout=10,
+        ) as response:
+            if not (200 <= response.status < 300):
+                release_notification(reference, token, f"HTTP_{response.status}")
+                return False
+        if complete_notification(reference, token):
+            return True
+        log("Delivery acknowledgment race: lease changed; manual reconciliation required")
+        return False
     except Exception as exc:
+        # Never write response bodies, URLs with query tokens, or credentials.
         log(f"Fulfillment notification failed: {type(exc).__name__}")
-        with _connect() as connection:
-            connection.execute(
-                "UPDATE payments SET status = 'PAID_PENDING_FULFILLMENT' WHERE payment_reference = ?",
-                (payment["payment_reference"],),
-            )
+        release_notification(reference, token, type(exc).__name__)
         return False
 
 
 def aggregate_revenue() -> dict:
+    # PaymentIntents and the Stripe ledger remain authoritative; this is only
+    # a receiver-level record of distinct paid payment references.
     with _connect() as connection:
-        row = connection.execute(
+        rows = connection.execute(
             """
-            SELECT COUNT(*) AS paid_events,
+            SELECT currency, COUNT(*) AS paid_events,
                    COALESCE(SUM(amount_minor), 0) AS gross_minor,
-                   COALESCE(SUM(CASE WHEN recurring = 1 THEN amount_minor ELSE 0 END), 0) AS recurring_collections_minor
+                   COALESCE(SUM(CASE WHEN recurring = 1 THEN amount_minor ELSE 0 END), 0)
+                       AS recurring_collections_minor
             FROM payments
+            GROUP BY currency
+            ORDER BY currency
             """
-        ).fetchone()
+        ).fetchall()
+        alias_rows = connection.execute(
+            "SELECT reconciliation_state, COUNT(*) AS total "
+            "FROM payment_receipt_aliases GROUP BY reconciliation_state"
+        ).fetchall()
+    alias_counts = {row["reconciliation_state"]: row["total"] for row in alias_rows}
+    by_currency = {
+        row["currency"]: {
+            "paid_events": row["paid_events"],
+            "gross_collected_minor": row["gross_minor"],
+            "recurring_collections_minor": row["recurring_collections_minor"],
+        }
+        for row in rows
+    }
+    unambiguous = next(iter(by_currency.values())) if len(by_currency) == 1 else None
     return {
-        "paid_events": row["paid_events"],
-        "gross_collected_minor": row["gross_minor"],
-        "recurring_collections_minor": row["recurring_collections_minor"],
-        "currency_note": "Amounts are stored in each payment's currency; do not combine mixed currencies for accounting.",
+        "paid_events": sum(r["paid_events"] for r in by_currency.values()),
+        # Do not add incompatible minor units (USD + EUR, etc.).
+        "gross_collected_minor": (
+            unambiguous["gross_collected_minor"] if unambiguous else
+            (0 if not by_currency else None)
+        ),
+        "recurring_collections_minor": (
+            unambiguous["recurring_collections_minor"] if unambiguous else
+            (0 if not by_currency else None)
+        ),
+        "by_currency": by_currency,
+        "invoice_receipt_alias_counts": alias_counts,
+        "currency_note": "Totals are grouped by currency; global minor-unit sums are omitted when currencies differ.",
         "mrr_note": "Recurring collections are not normalized MRR. Use Stripe Billing for authoritative MRR.",
     }
 
@@ -314,6 +609,7 @@ class Handler(BaseHTTPRequestHandler):
         data = json.dumps(body).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -323,11 +619,30 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health":
             self._json(200, {
                 "ok": True,
-                "webhook_verification": bool(STRIPE_WEBHOOK_SECRET) or ALLOW_UNVERIFIED_WEBHOOKS,
-                "fulfillment_configured": bool(FULFILLMENT_WEBHOOK_URL),
-                "database": str(DB_PATH),
+                "webhook_verification": bool(STRIPE_WEBHOOK_SECRET),
+                "fulfillment_configured": bool(FULFILLMENT_WEBHOOK_URL and FULFILLMENT_WEBHOOK_TOKEN),
+            })
+        elif path == "/readyz":
+            try:
+                with _connect() as connection:
+                    connection.execute("SELECT 1").fetchone()
+                database_ready = True
+            except sqlite3.Error:
+                database_ready = False
+            ready = bool(STRIPE_WEBHOOK_SECRET) and database_ready
+            self._json(200 if ready else 503, {
+                "ready": ready,
+                "webhook_verification": bool(STRIPE_WEBHOOK_SECRET),
+                "database_ready": database_ready,
+                "fulfillment_configured": bool(FULFILLMENT_WEBHOOK_URL and FULFILLMENT_WEBHOOK_TOKEN),
             })
         elif path in ("/revenue", "/mrr"):
+            if not METRICS_READ_TOKEN:
+                self._json(503, {"error": "private metrics not configured"})
+                return
+            if not metrics_authorized(self.headers.get("Authorization", "")):
+                self._json(401, {"error": "unauthorized"})
+                return
             self._json(200, aggregate_revenue())
         else:
             self._json(404, {"error": "not found"})
@@ -346,16 +661,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         payload = self.rfile.read(length)
         signature = self.headers.get("Stripe-Signature", "")
-        if STRIPE_WEBHOOK_SECRET:
-            if not verify_stripe_signature(payload, signature, STRIPE_WEBHOOK_SECRET):
-                self._json(400, {"error": "invalid signature"})
-                return
-        elif not ALLOW_UNVERIFIED_WEBHOOKS:
+        if not STRIPE_WEBHOOK_SECRET:
             log("Webhook rejected: STRIPE_WEBHOOK_SECRET is not configured")
             self._json(503, {"error": "webhook verification not configured"})
             return
-        else:
-            log("WARNING: accepting unverified webhook because ALLOW_UNVERIFIED_WEBHOOKS=true")
+        if not verify_stripe_signature(payload, signature, STRIPE_WEBHOOK_SECRET):
+            self._json(400, {"error": "invalid signature"})
+            return
         try:
             event = json.loads(payload)
             if not isinstance(event, dict):
@@ -381,8 +693,8 @@ class Handler(BaseHTTPRequestHandler):
                     event_id = str(event.get("id") or "").strip()
                     with _connect() as connection:
                         row = connection.execute(
-                            "SELECT * FROM payments WHERE event_id = ? AND status = ? LIMIT 1",
-                            (event_id, "PAID_PENDING_FULFILLMENT"),
+                            "SELECT * FROM payments WHERE event_id = ? AND status IN (?, ?) LIMIT 1",
+                            (event_id, "PAID_PENDING_FULFILLMENT", "NOTIFICATION_IN_FLIGHT"),
                         ).fetchone()
                         if row:
                             pending = dict(row)
@@ -399,8 +711,18 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._json(200, {"received": True, "duplicate": True})
             return
-        notified = notify_fulfillment(payment) if payment else False
+        notified = notify_fulfillment(payment) if payment and not requires_manual_review(payment) else False
         if payment:
+            if requires_manual_review(payment):
+                log(f"PAYMENT HELD for offer attribution reference={payment['payment_reference']}")
+                self._json(200, {
+                    "received": True,
+                    "payment_queued": True,
+                    "fulfillment_notified": False,
+                    "fulfillment_held": True,
+                    "reason": "manual_offer_attribution",
+                })
+                return
             log(f"PAYMENT QUEUED reference={payment['payment_reference']} sku={payment['sku']} amount_minor={payment['amount_minor']}")
             if FULFILLMENT_WEBHOOK_URL and not notified:
                 # Return non-2xx so Stripe retries; payment row already persisted.
@@ -420,7 +742,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     init_db()
-    if not STRIPE_WEBHOOK_SECRET and not ALLOW_UNVERIFIED_WEBHOOKS:
+    if not STRIPE_WEBHOOK_SECRET:
         log("STRIPE_WEBHOOK_SECRET missing: health checks pass, but webhooks are rejected")
     log(f"Garcar Payments v2 listening on 0.0.0.0:{PORT}; database={DB_PATH}")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

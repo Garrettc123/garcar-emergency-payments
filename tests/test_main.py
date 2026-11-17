@@ -1,10 +1,17 @@
 import hashlib
+import io
+import os
+from unittest.mock import patch
 import hmac
 import json
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
+from http.server import ThreadingHTTPServer
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 import main
 
@@ -40,6 +47,108 @@ class PaymentReceiverTests(unittest.TestCase):
         self.assertTrue(main.verify_stripe_signature(payload, header, "whsec_test", now=timestamp))
         self.assertFalse(main.verify_stripe_signature(payload, header, "wrong", now=timestamp))
 
+
+    def test_legacy_unsigned_bypass_never_accepts_live_money_event(self):
+        event = self.checkout_event("evt_unsigned")
+        event["livemode"] = True
+        payload = json.dumps(event).encode()
+        handler = object.__new__(main.Handler)
+        handler.path = "/stripe-webhook"
+        handler.headers = {"Content-Length": str(len(payload))}
+        handler.rfile = io.BytesIO(payload)
+        responses = []
+        handler._json = lambda status, body: responses.append((status, body))
+        with patch.object(main, "STRIPE_WEBHOOK_SECRET", ""), patch.dict(
+            os.environ, {"ALLOW_UNVERIFIED_WEBHOOKS": "true", "GARCAR_ENV": "development"}
+        ):
+            handler.do_POST()
+        self.assertEqual(responses[0][0], 503)
+        self.assertEqual(main.aggregate_revenue()["paid_events"], 0)
+
+    def test_invalid_webhook_signature_cannot_record_a_payment(self):
+        event = self.checkout_event("evt_wrong_sig")
+        event["livemode"] = True
+        payload = json.dumps(event).encode()
+        handler = object.__new__(main.Handler)
+        handler.path = "/stripe-webhook"
+        handler.headers = {"Content-Length": str(len(payload)), "Stripe-Signature": "wrong"}
+        handler.rfile = io.BytesIO(payload)
+        responses = []
+        handler._json = lambda status, body: responses.append((status, body))
+        with patch.object(main, "STRIPE_WEBHOOK_SECRET", "whsec_test"):
+            handler.do_POST()
+        self.assertEqual(responses[0][0], 400)
+        self.assertEqual(main.aggregate_revenue()["paid_events"], 0)
+
+    def test_fulfillment_notification_requires_authentication_token(self):
+        event = self.checkout_event("evt_no_callback_auth")
+        event["data"]["object"]["metadata"] = {"sku": "GAR-REVIEW-497"}
+        event["data"]["object"]["payment_intent"] = "pi_no_callback_auth"
+        _, payment = main.record_event(event, json.dumps(event).encode())
+        with patch.object(main, "FULFILLMENT_WEBHOOK_URL", "https://example.invalid/notify"), patch.object(
+            main, "FULFILLMENT_WEBHOOK_TOKEN", ""
+        ), patch.object(main, "urlopen", side_effect=AssertionError("MUST NOT send")):
+            self.assertFalse(main.notify_fulfillment(payment))
+        with main._connect() as db:
+            status = db.execute(
+                "SELECT status FROM payments WHERE payment_reference = ?",
+                ("pi_no_callback_auth",),
+            ).fetchone()["status"]
+        self.assertEqual(status, "PAID_PENDING_FULFILLMENT")
+
+    def test_local_http_signed_replay_and_invalid_signature(self):
+        # Real HTTP handler and SQLite writes, with a local ephemeral listener.
+        # This test sends no request to Stripe or production infrastructure.
+        event = self.checkout_event("evt_http_signed")
+        event["livemode"] = True
+        event["data"]["object"]["payment_intent"] = "pi_http_signed"
+        event["data"]["object"]["metadata"] = {"sku": "GAR-REVIEW-497"}
+        payload = json.dumps(event).encode()
+        secret = "whsec_local_ci_only"
+        timestamp = int(time.time())
+        signature = hmac.new(
+            secret.encode(), f"{timestamp}.".encode() + payload,
+            hashlib.sha256
+        ).hexdigest()
+        signed_header = f"t={timestamp},v1={signature}"
+        with patch.object(main, "STRIPE_WEBHOOK_SECRET", secret), patch.object(
+            main, "FULFILLMENT_WEBHOOK_URL", ""
+        ), ThreadingHTTPServer(("127.0.0.1", 0), main.Handler) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            url = f"http://127.0.0.1:{server.server_port}/stripe-webhook"
+            try:
+                def send(signature_header):
+                    request = Request(
+                        url, data=payload,
+                        headers={"Content-Type": "application/json",
+                                 "Stripe-Signature": signature_header},
+                        method="POST",
+                    )
+                    with urlopen(request, timeout=5) as response:
+                        self.assertEqual(response.status, 200)
+                        return json.loads(response.read())
+
+                first = send(signed_header)
+                self.assertTrue(first["payment_queued"])
+                duplicate = send(signed_header)
+                self.assertTrue(duplicate["duplicate"])
+                with self.assertRaises(HTTPError) as raised:
+                    send(f"t={timestamp},v1={'0' * 64}")
+                self.assertEqual(raised.exception.code, 400)
+
+                with main._connect() as db:
+                    self.assertEqual(db.execute(
+                        "SELECT COUNT(*) FROM payments"
+                    ).fetchone()[0], 1)
+                    self.assertEqual(db.execute(
+                        "SELECT COUNT(*) FROM stripe_events"
+                    ).fetchone()[0], 1)
+                self.assertEqual(main.aggregate_revenue()["paid_events"], 1)
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+
     def test_idempotent_event_and_payment(self):
         event = self.checkout_event()
         event["data"]["object"]["metadata"] = {"sku": "contractor-audit-47", "offer_name": "Contractor Audit"}
@@ -59,6 +168,7 @@ class PaymentReceiverTests(unittest.TestCase):
         event["data"]["object"]["amount_total"] = 250000
         payment = main.extract_payment(event)
         self.assertEqual(payment["sku"], "manual-review-unattributed")
+        self.assertEqual(payment["status"], "PAID_MANUAL_REVIEW")
 
     def test_ambiguous_497_requires_manual_review(self):
         event = self.checkout_event("evt_497")
@@ -66,6 +176,7 @@ class PaymentReceiverTests(unittest.TestCase):
         event["data"]["object"]["amount_total"] = 49700
         payment = main.extract_payment(event)
         self.assertEqual(payment["sku"], "manual-review-497")
+        self.assertEqual(payment["status"], "PAID_MANUAL_REVIEW")
 
     def test_metadata_disambiguates_offer(self):
         event = self.checkout_event("evt_meta")
@@ -77,10 +188,511 @@ class PaymentReceiverTests(unittest.TestCase):
         self.assertEqual(payment["sku"], "workflow-sprint-497")
         self.assertEqual(payment["fulfill_hours"], 24)
 
+    def test_unattributed_payment_never_dispatches(self):
+        from unittest.mock import patch
+
+        event = self.checkout_event("evt_attribution_hold")
+        event["data"]["object"]["payment_intent"] = "pi_attribution_hold"
+        event["data"]["object"]["amount_total"] = 49700
+        inserted, payment = main.record_event(event, json.dumps(event).encode())
+        self.assertTrue(inserted)
+        self.assertEqual(payment["status"], "PAID_MANUAL_REVIEW")
+        with patch.object(main, "FULFILLMENT_WEBHOOK_URL", "https://example.invalid/notify"):
+            with patch.object(main, "urlopen", side_effect=AssertionError("MUST NOT send")):
+                self.assertFalse(main.notify_fulfillment(payment))
+        with main._connect() as connection:
+            row = connection.execute(
+                "SELECT status FROM payments WHERE payment_reference = ?",
+                ("pi_attribution_hold",),
+            ).fetchone()
+        self.assertEqual(row["status"], "PAID_MANUAL_REVIEW")
+
+    def test_known_sku_can_be_fulfilled(self):
+        event = self.checkout_event("evt_known")
+        event["data"]["object"]["metadata"] = {
+            "sku": "GAR-REVIEW-497",
+            "offer_name": "Lead Follow-Up Review",
+        }
+        payment = main.extract_payment(event)
+        self.assertEqual(payment["status"], "PAID_PENDING_FULFILLMENT")
+        self.assertFalse(main.requires_manual_review(payment))
+
+    def test_name_only_metadata_requires_manual_review(self):
+        event = self.checkout_event("evt_name_only")
+        event["data"]["object"]["metadata"] = {"offer_name": "Unknown"}
+        payment = main.extract_payment(event)
+        self.assertEqual(payment["status"], "PAID_MANUAL_REVIEW")
+
+    def test_notification_lease_and_stale_claim_protection(self):
+        event = self.checkout_event("evt_claim")
+        event["data"]["object"]["metadata"] = {"sku": "GAR-REVIEW-497"}
+        event["data"]["object"]["payment_intent"] = "pi_claim"
+        _, payment = main.record_event(event, json.dumps(event).encode())
+        first = main.claim_notification(payment["payment_reference"], now=1000)
+        self.assertIsNotNone(first)
+        self.assertIsNone(main.claim_notification(payment["payment_reference"], now=1001))
+        replacement = main.claim_notification(payment["payment_reference"], now=1121)
+        self.assertIsNotNone(replacement)
+        self.assertNotEqual(first, replacement)
+        self.assertFalse(main.complete_notification(payment["payment_reference"], first))
+        self.assertFalse(main.release_notification(payment["payment_reference"], first, "stale"))
+        self.assertTrue(main.complete_notification(payment["payment_reference"], replacement))
+        self.assertTrue(main.notification_accepted(payment["payment_reference"]))
+        self.assertIsNone(main.claim_notification(payment["payment_reference"], now=2000))
+
+    def test_failed_notification_releases_for_retry(self):
+        event = self.checkout_event("evt_release")
+        event["data"]["object"]["metadata"] = {"sku": "GAR-REVIEW-497"}
+        event["data"]["object"]["payment_intent"] = "pi_release"
+        _, payment = main.record_event(event, json.dumps(event).encode())
+        first = main.claim_notification(payment["payment_reference"], now=10)
+        self.assertTrue(main.release_notification(payment["payment_reference"], first, "HTTP_503"))
+        second = main.claim_notification(payment["payment_reference"], now=11)
+        self.assertIsNotNone(second)
+        self.assertNotEqual(first, second)
+
+    def test_manual_review_cannot_be_leased(self):
+        event = self.checkout_event("evt_manual_hold")
+        event["data"]["object"]["payment_intent"] = "pi_manual_hold"
+        event["data"]["object"]["amount_total"] = 49700
+        _, payment = main.record_event(event, json.dumps(event).encode())
+        self.assertEqual(payment["status"], "PAID_MANUAL_REVIEW")
+        self.assertIsNone(main.claim_notification(payment["payment_reference"], now=100))
+
+    def test_legacy_unconfirmed_notification_requires_reconciliation(self):
+        event = self.checkout_event("evt_old")
+        event["data"]["object"]["metadata"] = {"sku": "GAR-REVIEW-497"}
+        event["data"]["object"]["payment_intent"] = "pi_old"
+        _, payment = main.record_event(event, json.dumps(event).encode())
+        with main._connect() as db:
+            db.execute(
+                "UPDATE payments SET status = 'FULFILLMENT_NOTIFIED' WHERE payment_reference = ?",
+                (payment["payment_reference"],),
+            )
+        main.init_db()
+        with main._connect() as db:
+            status = db.execute(
+                "SELECT status FROM payments WHERE payment_reference = ?",
+                (payment["payment_reference"],),
+            ).fetchone()["status"]
+        self.assertEqual(status, "DELIVERY_RECONCILIATION_REQUIRED")
+        self.assertIsNone(main.claim_notification(payment["payment_reference"], now=100))
+
+    def test_claim_retry_budget_exhaustion(self):
+        event = self.checkout_event("evt_exhaust")
+        event["data"]["object"]["metadata"] = {"sku": "GAR-REVIEW-497"}
+        event["data"]["object"]["payment_intent"] = "pi_exhaust"
+        _, payment = main.record_event(event, json.dumps(event).encode())
+        reference = payment["payment_reference"]
+        for i in range(main.MAX_NOTIFICATION_ATTEMPTS):
+            token = main.claim_notification(reference, now=100 + i)
+            self.assertTrue(token)
+            self.assertTrue(main.release_notification(reference, token, "HTTP_502"))
+        self.assertIsNone(main.claim_notification(reference, now=10000))
+        with main._connect() as db:
+            state = db.execute(
+                "SELECT status FROM payments WHERE payment_reference = ?", (reference,)
+            ).fetchone()["status"]
+        self.assertEqual(state, "DELIVERY_MANUAL_INTERVENTION")
+
+    def test_subscription_checkout_and_invoice_count_once(self):
+        # A subscription's paid Checkout and initial paid invoice describe
+        # the same collection. The invoice is the sole payment ledger record.
+        checkout = self.checkout_event("evt_sub_checkout")
+        checkout["data"]["object"].update({
+            "mode": "subscription",
+            "payment_intent": None,
+            "subscription": "sub_1",
+            "amount_total": 49700,
+            "metadata": {"sku": "GAR-CLOCK-MONTHLY"},
+        })
+        self.assertIsNone(main.extract_payment(checkout))
+        inserted, receipt = main.record_event(checkout, json.dumps(checkout).encode())
+        self.assertTrue(inserted)
+        self.assertIsNone(receipt)
+        async_checkout = self.checkout_event("evt_sub_async")
+        async_checkout["type"] = "checkout.session.async_payment_succeeded"
+        async_checkout["data"]["object"]["mode"] = "subscription"
+        self.assertIsNone(main.extract_payment(async_checkout))
+        invoice = {
+            "id": "evt_sub_invoice",
+            "type": "invoice.paid",
+            "data": {"object": {
+                "id": "in_sub_1",
+                "payment_intent": "pi_sub_1",
+                "amount_paid": 49700,
+                "currency": "usd",
+                "customer_email": "buyer@example.com",
+                "metadata": {"sku": "GAR-CLOCK-MONTHLY"},
+                "parent": {
+                    "type": "subscription_details",
+                    "subscription_details": {
+                        "subscription": "sub_1",
+                        "metadata": {"sku": "GAR-CLOCK-MONTHLY"},
+                    },
+                },
+            }},
+        }
+        inserted, receipt = main.record_event(invoice, json.dumps(invoice).encode())
+        self.assertTrue(inserted)
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt["recurring"], 1)
+        duplicate, second = main.record_event(invoice, json.dumps(invoice).encode())
+        self.assertFalse(duplicate)
+        self.assertIsNone(second)
+        summary = main.aggregate_revenue()
+        self.assertEqual(summary["paid_events"], 1)
+        self.assertEqual(summary["by_currency"]["usd"]["gross_collected_minor"], 49700)
+
+    def test_one_time_checkout_still_counts(self):
+        checkout = self.checkout_event("evt_one_time")
+        checkout["data"]["object"].update({
+            "mode": "payment",
+            "metadata": {"sku": "GAR-REVIEW-497"},
+        })
+        receipt = main.extract_payment(checkout)
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt["recurring"], 0)
+
+    def test_modern_subscription_invoice_uses_snapshot_sku(self):
+        invoice = {
+            "id": "evt_invoice_modern",
+            "type": "invoice.paid",
+            "data": {"object": {
+                "id": "in_modern",
+                "amount_paid": 49700,
+                "currency": "usd",
+                "metadata": {},
+                "parent": {
+                    "type": "subscription_details",
+                    "subscription_details": {
+                        "subscription": "sub_modern",
+                        "metadata": {
+                            "sku": "GAR-CLOCK-MONTHLY",
+                            "offer_name": "Callback Clock",
+                        },
+                    },
+                },
+            }},
+        }
+        receipt = main.extract_payment(invoice)
+        self.assertEqual(receipt["sku"], "GAR-CLOCK-MONTHLY")
+        self.assertEqual(receipt["status"], "PAID_PENDING_FULFILLMENT")
+        self.assertEqual(receipt["recurring"], 1)
+        self.assertEqual(json.loads(receipt["metadata_json"])["sku"], "GAR-CLOCK-MONTHLY")
+
+    def test_one_time_paid_invoice_is_not_recurring(self):
+        invoice = {
+            "id": "evt_one_time_invoice",
+            "type": "invoice.paid",
+            "data": {"object": {
+                "id": "in_one_time",
+                "amount_paid": 250000,
+                "currency": "usd",
+                "billing_reason": "manual",
+                "metadata": {"sku": "GAR-CLOCK-2500"},
+            }},
+        }
+        receipt = main.extract_payment(invoice)
+        self.assertEqual(receipt["recurring"], 0)
+        self.assertEqual(receipt["sku"], "GAR-CLOCK-2500")
+        self.assertEqual(receipt["status"], "PAID_PENDING_FULFILLMENT")
+
+    def test_conflicting_subscription_invoice_skus_require_manual_review(self):
+        invoice = {
+            "id": "evt_conflicting_invoice",
+            "type": "invoice.paid",
+            "data": {"object": {
+                "id": "in_conflicting",
+                "amount_paid": 49700,
+                "currency": "usd",
+                "metadata": {"sku": "OTHER-OFFER"},
+                "parent": {
+                    "type": "subscription_details",
+                    "subscription_details": {
+                        "subscription": "sub_conflicting",
+                        "metadata": {"sku": "GAR-CLOCK-MONTHLY"},
+                    },
+                },
+            }},
+        }
+        receipt = main.extract_payment(invoice)
+        self.assertEqual(receipt["status"], "PAID_MANUAL_REVIEW")
+        self.assertEqual(receipt["sku"], "manual-review-conflicting-sku")
+        self.assertTrue(main.requires_manual_review(receipt))
+
+    def test_legacy_subscription_invoice_metadata_is_supported(self):
+        invoice = {
+            "id": "evt_legacy_invoice",
+            "type": "invoice.paid",
+            "data": {"object": {
+                "id": "in_legacy",
+                "subscription": "sub_legacy",
+                "amount_paid": 49700,
+                "currency": "usd",
+                "subscription_details": {
+                    "metadata": {"sku": "GAR-CLOCK-MONTHLY"},
+                },
+            }},
+        }
+        receipt = main.extract_payment(invoice)
+        self.assertEqual(receipt["recurring"], 1)
+        self.assertEqual(receipt["sku"], "GAR-CLOCK-MONTHLY")
+
+    def test_unattributed_subscription_invoice_is_held(self):
+        invoice = {
+            "id": "evt_unattributed_invoice",
+            "type": "invoice.paid",
+            "data": {"object": {
+                "id": "in_unattributed",
+                "parent": {
+                    "type": "subscription_details",
+                    "subscription_details": {
+                        "subscription": "sub_unattributed",
+                        "metadata": {},
+                    },
+                },
+                "amount_paid": 49700,
+                "currency": "usd",
+                "metadata": {},
+            }},
+        }
+        receipt = main.extract_payment(invoice)
+        self.assertEqual(receipt["recurring"], 1)
+        self.assertEqual(receipt["status"], "PAID_MANUAL_REVIEW")
+
+    def test_one_invoice_two_stripe_events_counts_once(self):
+        # Different signed Stripe Event IDs can refer to the same paid invoice.
+        # A payment intent might also be absent from modern invoice objects.
+        def invoice_event(event_id, payment_intent=None):
+            return {
+                "id": event_id,
+                "type": "invoice.paid",
+                "data": {"object": {
+                    "id": "in_stable_1",
+                    "payment_intent": payment_intent,
+                    "amount_paid": 49700,
+                    "currency": "usd",
+                    "billing_reason": "subscription_cycle",
+                    "metadata": {"sku": "GAR-CLOCK-MONTHLY"},
+                }},
+            }
+
+        first = invoice_event("evt_invoice_first", "pi_old_reference")
+        inserted, receipt = main.record_event(first, json.dumps(first).encode())
+        self.assertTrue(inserted)
+        self.assertEqual(receipt["payment_reference"], "invoice:in_stable_1")
+        self.assertEqual(receipt["recurring"], 1)
+
+        second = invoice_event("evt_invoice_second")
+        inserted, second_receipt = main.record_event(second, json.dumps(second).encode())
+        self.assertTrue(inserted)  # New event recorded for audit.
+        self.assertIsNone(second_receipt)  # Same invoice cannot be charged twice.
+        with main._connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM stripe_events").fetchone()[0], 2)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM payments").fetchone()[0], 1)
+        self.assertEqual(main.aggregate_revenue()["paid_events"], 1)
+
+    def test_distinct_subscription_invoices_are_not_suppressed(self):
+        # Renewals remain separate collections even on the same subscription.
+        for index in (1, 2):
+            event = {
+                "id": f"evt_sub_cycle_{index}",
+                "type": "invoice.paid",
+                "data": {"object": {
+                    "id": f"in_sub_cycle_{index}",
+                    "amount_paid": 49700,
+                    "currency": "usd",
+                    "billing_reason": "subscription_cycle",
+                    "metadata": {"sku": "GAR-CLOCK-MONTHLY"},
+                }},
+            }
+            inserted, receipt = main.record_event(event, json.dumps(event).encode())
+            self.assertTrue(inserted)
+            self.assertEqual(receipt["payment_reference"], f"invoice:in_sub_cycle_{index}")
+        self.assertEqual(main.aggregate_revenue()["paid_events"], 2)
+
+    def _legacy_paid_checkout(self, suffix="same", amount=49700):
+        old = self.checkout_event("evt_legacy_" + suffix)
+        old["data"]["object"].update({
+            "id": "cs_legacy_" + suffix,
+            "payment_intent": "pi_legacy_" + suffix,
+            "amount_total": amount,
+            "metadata": {"sku": "RRS-497-WEEK"},
+        })
+        inserted, row = main.record_event(old, json.dumps(old).encode())
+        self.assertTrue(inserted)
+        self.assertIsNotNone(row)
+        return old
+
+    def _paid_invoice(self, event_id, suffix="same", amount=49700, payment_id=True):
+        obj = {
+            "id": "in_legacy_" + suffix,
+            "amount_paid": amount, "currency": "usd",
+            "billing_reason": "subscription_cycle",
+            "metadata": {"sku": "RRS-497-WEEK"},
+        }
+        if payment_id:
+            obj["payment_intent"] = "pi_legacy_" + suffix
+        return {"id": event_id, "type": "invoice.paid", "data": {"object": obj}}
+
+    def test_prior_checkout_receipt_does_not_double_count_paid_invoice(self):
+        self._legacy_paid_checkout()
+        invoice = self._paid_invoice("evt_paid_new_1")
+        saved, payment = main.record_event(invoice, json.dumps(invoice).encode())
+        self.assertTrue(saved)
+        self.assertIsNone(payment)
+        with main._connect() as db:
+            aliases = db.execute(
+                "SELECT * FROM payment_receipt_aliases WHERE invoice_reference = ?",
+                ("invoice:in_legacy_same",),
+            ).fetchall()
+            self.assertEqual(len(aliases), 1)
+            self.assertEqual(aliases[0]["legacy_reference"], "pi_legacy_same")
+            self.assertEqual(aliases[0]["reconciliation_state"], "MATCHED_LEGACY_RECEIPT")
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM stripe_events").fetchone()[0], 2)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM payments").fetchone()[0], 1)
+        self.assertEqual(main.aggregate_revenue()["paid_events"], 1)
+        self.assertEqual(main.aggregate_revenue()["gross_collected_minor"], 49700)
+
+    def test_later_invoice_event_without_pi_still_respects_persisted_alias(self):
+        self._legacy_paid_checkout()
+        original = self._paid_invoice("evt_paid_new_1")
+        main.record_event(original, json.dumps(original).encode())
+        main.init_db()  # Database migration/restart must not erase alias.
+        repeated = self._paid_invoice("evt_paid_new_2", payment_id=False)
+        saved, payment = main.record_event(repeated, json.dumps(repeated).encode())
+        self.assertTrue(saved)
+        self.assertIsNone(payment)
+        self.assertEqual(main.aggregate_revenue()["paid_events"], 1)
+        with main._connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM payment_receipt_aliases").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM stripe_events").fetchone()[0], 3)
+
+    def test_legacy_mismatched_amount_is_held_for_reconciliation(self):
+        self._legacy_paid_checkout(amount=49700)
+        invoice = self._paid_invoice("evt_bad_total", amount=149700)
+        saved, payment = main.record_event(invoice, json.dumps(invoice).encode())
+        self.assertTrue(saved)
+        self.assertIsNone(payment)
+        self.assertEqual(main.aggregate_revenue()["paid_events"], 1)
+        with main._connect() as db:
+            alias = db.execute(
+                "SELECT reconciliation_state, invoice_amount_minor FROM payment_receipt_aliases"
+            ).fetchone()
+        self.assertEqual(alias["reconciliation_state"], "MANUAL_RECONCILIATION")
+        self.assertEqual(alias["invoice_amount_minor"], 149700)
+
+    def test_modern_paid_invoice_payment_list_links_legacy_receipt(self):
+        self._legacy_paid_checkout(suffix="modern")
+        invoice = self._paid_invoice("evt_modern_1", suffix="modern", payment_id=False)
+        invoice["data"]["object"]["payments"] = {"data": [{
+            "status": "paid",
+            "payment": {"type": "payment_intent", "payment_intent": "pi_legacy_modern"},
+        }]}
+        saved, payment = main.record_event(invoice, json.dumps(invoice).encode())
+        self.assertTrue(saved)
+        self.assertIsNone(payment)
+        self.assertEqual(main.aggregate_revenue()["paid_events"], 1)
+
+    def test_failed_invoice_payment_attempt_is_not_legacy_alias(self):
+        self._legacy_paid_checkout(suffix="failed")
+        invoice = self._paid_invoice("evt_failed_candidate", suffix="failed", payment_id=False)
+        invoice["data"]["object"]["payments"] = {"data": [{
+            "status": "unpaid",
+            "payment": {"type": "payment_intent", "payment_intent": "pi_legacy_failed"},
+        }]}
+        saved, payment = main.record_event(invoice, json.dumps(invoice).encode())
+        self.assertTrue(saved)
+        self.assertIsNotNone(payment)
+        with main._connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM payment_receipt_aliases").fetchone()[0], 0)
+
+    def test_partial_invoice_payment_list_requires_reconciliation(self):
+        self._legacy_paid_checkout(suffix="partial")
+        invoice = self._paid_invoice("evt_partial", suffix="partial", payment_id=False)
+        invoice["data"]["object"]["payments"] = {
+            "has_more": True,
+            "data": [{
+                "status": "paid",
+                "payment": {"type": "payment_intent", "payment_intent": "pi_legacy_partial"},
+            }],
+        }
+        saved, payment = main.record_event(invoice, json.dumps(invoice).encode())
+        self.assertTrue(saved)
+        self.assertIsNone(payment)
+        self.assertEqual(main.aggregate_revenue()["paid_events"], 1)
+        self.assertEqual(main.aggregate_revenue()["invoice_receipt_alias_counts"],
+                         {"MANUAL_RECONCILIATION": 1})
+
+    def test_legacy_alias_counts_are_private_aggregated_evidence(self):
+        self._legacy_paid_checkout(suffix="alias_count")
+        invoice = self._paid_invoice("evt_alias_count", suffix="alias_count")
+        main.record_event(invoice, json.dumps(invoice).encode())
+        report = main.aggregate_revenue()
+        self.assertEqual(report["invoice_receipt_alias_counts"],
+                         {"MATCHED_LEGACY_RECEIPT": 1})
+        self.assertEqual(report["paid_events"], 1)
+        self.assertNotIn("buyer@example.com", json.dumps(report))
+
+    def test_new_invoice_with_new_payment_intent_remains_distinct(self):
+        self._legacy_paid_checkout(suffix="renewal")
+        invoice = self._paid_invoice("evt_renewal_new", suffix="renewal")
+        invoice["data"]["object"]["id"] = "in_renewal_new"
+        invoice["data"]["object"]["payment_intent"] = "pi_renewal_new"
+        saved, payment = main.record_event(invoice, json.dumps(invoice).encode())
+        self.assertTrue(saved)
+        self.assertIsNotNone(payment)
+        self.assertEqual(payment["payment_reference"], "invoice:in_renewal_new")
+        self.assertEqual(main.aggregate_revenue()["paid_events"], 2)
+
+    def test_invoice_without_stable_id_cannot_create_payment(self):
+        event = {
+            "id": "evt_invoice_without_id",
+            "type": "invoice.paid",
+            "data": {"object": {
+                "amount_paid": 49700,
+                "currency": "usd",
+                "billing_reason": "subscription_cycle",
+                "metadata": {"sku": "GAR-CLOCK-MONTHLY"},
+            }},
+        }
+        self.assertIsNone(main.extract_payment(event))
+        inserted, receipt = main.record_event(event, json.dumps(event).encode())
+        self.assertTrue(inserted)  # Evidence of receipt is retained.
+        self.assertIsNone(receipt)
+        self.assertEqual(main.aggregate_revenue()["paid_events"], 0)
+
     def test_unpaid_checkout_is_not_queued(self):
         event = self.checkout_event("evt_unpaid")
         event["data"]["object"]["payment_status"] = "unpaid"
         self.assertIsNone(main.extract_payment(event))
+
+    def test_metrics_authorization_fails_closed(self):
+        previous = main.METRICS_READ_TOKEN
+        try:
+            main.METRICS_READ_TOKEN = ""
+            self.assertFalse(main.metrics_authorized("Bearer any"))
+            main.METRICS_READ_TOKEN = "private-token-value"
+            self.assertFalse(main.metrics_authorized(""))
+            self.assertFalse(main.metrics_authorized("Bearer wrong"))
+            self.assertTrue(main.metrics_authorized("Bearer private-token-value"))
+        finally:
+            main.METRICS_READ_TOKEN = previous
+
+    def test_currency_totals_are_never_mixed(self):
+        usd = self.checkout_event("evt_usd")
+        payload = json.dumps(usd).encode()
+        main.record_event(usd, payload)
+        eur = self.checkout_event("evt_eur")
+        eur["data"]["object"]["payment_intent"] = "pi_eur"
+        eur["data"]["object"]["currency"] = "eur"
+        main.record_event(eur, json.dumps(eur).encode())
+        totals = main.aggregate_revenue()
+        self.assertEqual(totals["paid_events"], 2)
+        self.assertIsNone(totals["gross_collected_minor"])
+        self.assertEqual(totals["by_currency"]["usd"]["gross_collected_minor"], 4700)
+        self.assertEqual(totals["by_currency"]["eur"]["gross_collected_minor"], 4700)
 
 
 if __name__ == "__main__":

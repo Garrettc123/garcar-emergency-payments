@@ -9,12 +9,12 @@ The earlier emergency receiver could accept unsigned webhooks when the signing s
 ## Production behavior
 
 - Rejects webhooks unless `STRIPE_WEBHOOK_SECRET` is configured.
-- Allows unsigned events only when `ALLOW_UNVERIFIED_WEBHOOKS=true` is explicitly set for local testing.
+- Always rejects unsigned webhooks, even when a legacy testing flag is set.
 - Verifies Stripe `v1` signatures and rejects stale timestamps.
 - Stores Stripe event IDs and payment references in SQLite with uniqueness constraints.
 - Ignores duplicate deliveries and unpaid Checkout sessions.
 - Uses Stripe metadata to disambiguate offers; an untagged `$497` purchase enters manual review.
-- Supports an optional HTTPS fulfillment webhook.
+- Supports an optional HTTPS fulfillment webhook only with a configured bearer authentication token.
 - Reports collected amounts without mislabeling them as authoritative MRR.
 
 ## Required environment
@@ -33,13 +33,7 @@ FULFILLMENT_WEBHOOK_URL=https://your-secure-automation.example/webhook
 FULFILLMENT_WEBHOOK_TOKEN=replace-with-a-long-secret
 ```
 
-Local unsigned testing only:
-
-```env
-ALLOW_UNVERIFIED_WEBHOOKS=true
-```
-
-Never enable that flag in production.
+All tests, including local development, must use correctly signed Stripe test events. The old `ALLOW_UNVERIFIED_WEBHOOKS` flag is ignored by the code.
 
 ## Run
 
@@ -109,3 +103,34 @@ Do not send paid traffic until all of these pass:
 ## Founder
 
 Garrett Carrol · Grandview / Kopperl, Texas
+
+## Readiness and private metrics (security hardening)
+
+- GET `/health` is public liveness and does not expose storage paths or revenue.
+- GET `/readyz` returns HTTP 503 until the signed-webhook receiver and database are ready; configure Railway's healthcheck path to `/readyz` after rollout.
+- GET `/revenue` and `/mrr` now require `Authorization: Bearer <METRICS_READ_TOKEN>`; without the variable the endpoint fails closed with HTTP 503.
+- Unsigned webhook intake is prohibited in every environment. Use the test signing secret and Stripe CLI or locally signed test fixtures.
+- Cross-currency totals appear in `by_currency`. A global minor-unit gross is `null` when multiple currencies exist.
+
+Before merging or deploying this change, provision a distinct, strong `METRICS_READ_TOKEN` on the payment receiver and update any authorized metrics consumers. Do not log or share its value. This PR does not alter the currently deployed production endpoint.
+
+
+## Crash-safe notification handoff (draft PR #3, NOT deployed)
+
+Verified signed, live-mode, paid Stripe events are persisted before any downstream notification. A SKU must be uniquely attributable. Unknown or name-only metadata is stored as `PAID_MANUAL_REVIEW` and never automatically dispatched.
+
+When `FULFILLMENT_WEBHOOK_URL` is configured, an eligible payment obtains a 120-second SQLite lease with a random claim token. A second concurrent worker cannot claim it. Expired leases can be reacquired on Stripe's subsequent signed redelivery; stale workers cannot overwrite the new owner's claim. HTTP 2xx is stored as `NOTIFICATION_ACCEPTED`, **not** as a claim that the purchased work or digital deliverable has been fulfilled.
+
+Non-2xx responses and network failures return the record to `PAID_PENDING_FULFILLMENT`. After 12 delivery attempts it moves to `DELIVERY_MANUAL_INTERVENTION` for operator reconciliation. Legacy `FULFILLMENT_NOTIFIED` rows from earlier versions are moved to `DELIVERY_RECONCILIATION_REQUIRED` because the old implementation set the state before receiving downstream HTTP acceptance; they are never blindly replayed.
+
+No background outbound notification worker is enabled by this change. Recovery relies on Stripe's retries, and an operator must reconcile events when Stripe's retry window has elapsed. The downstream system must enforce the stable `Idempotency-Key` header and **cannot** send customer communications, charge customers, or mark final delivery complete without its own approval and evidence gates.
+
+**Actual production posture observed November 16, 2026:** Railway mounts `/data` and has `STRIPE_WEBHOOK_SECRET` listed, but `FULFILLMENT_WEBHOOK_URL` and `METRICS_READ_TOKEN` were not in the receiver's variable names. Therefore downstream fulfillment is *not configured*, and a production merge without first provisioning private metrics access and validating compatibility would be unsafe.
+
+### Independent release verification
+Run on a reviewed checkout of the exact PR commit SHA, with real Python 3.12:
+```bash
+python -m py_compile main.py tests/test_main.py
+python -m unittest discover -s tests -p 'test_*.py' -v
+```
+Do not treat a GitHub Actions job with zero recorded steps as a passing test. Before deploying, validate a **signed Stripe test-mode event** against an isolated test receiver, verify duplicate handling and crash recovery, then test a legitimate live checkout and delivery receipt under operator approval. Never count a synthetic test event as real revenue.
