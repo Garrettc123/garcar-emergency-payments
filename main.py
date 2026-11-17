@@ -15,6 +15,15 @@ from urllib.request import Request, urlopen
 PORT = int(os.environ.get("PORT", "8080"))
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 ALLOW_UNVERIFIED_WEBHOOKS = os.environ.get("ALLOW_UNVERIFIED_WEBHOOKS", "false").lower() == "true"
+GARCAR_ENVIRONMENT = os.environ.get("GARCAR_ENVIRONMENT", "production").strip().lower()
+SERVER_HOST = os.environ.get("HOST", "0.0.0.0").strip()
+# Unsigned events are permissible ONLY on a loopback listener in local/test.
+# A production host setting always requires Stripe signature verification.
+UNSIGNED_LOCAL_TEST = (
+    ALLOW_UNVERIFIED_WEBHOOKS
+    and GARCAR_ENVIRONMENT in {"local", "test"}
+    and SERVER_HOST == "127.0.0.1"
+)
 FULFILLMENT_WEBHOOK_URL = os.environ.get("FULFILLMENT_WEBHOOK_URL", "")
 FULFILLMENT_WEBHOOK_TOKEN = os.environ.get("FULFILLMENT_WEBHOOK_TOKEN", "")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
@@ -322,10 +331,18 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/health":
             self._json(200, {
-                "ok": True,
-                "webhook_verification": bool(STRIPE_WEBHOOK_SECRET) or ALLOW_UNVERIFIED_WEBHOOKS,
+                "alive": True,
+                "webhook_signature_configured": bool(STRIPE_WEBHOOK_SECRET),
+                "unsigned_local_test_enabled": bool(UNSIGNED_LOCAL_TEST),
                 "fulfillment_configured": bool(FULFILLMENT_WEBHOOK_URL),
-                "database": str(DB_PATH),
+                "ready_for_live_webhooks": bool(STRIPE_WEBHOOK_SECRET),
+            })
+        elif path == "/ready":
+            configured = bool(STRIPE_WEBHOOK_SECRET)
+            self._json(200 if configured else 503, {
+                "ready": configured,
+                "reason": "signature_configured" if configured
+                          else "stripe_webhook_signing_secret_missing",
             })
         elif path in ("/revenue", "/mrr"):
             self._json(200, aggregate_revenue())
@@ -350,12 +367,12 @@ class Handler(BaseHTTPRequestHandler):
             if not verify_stripe_signature(payload, signature, STRIPE_WEBHOOK_SECRET):
                 self._json(400, {"error": "invalid signature"})
                 return
-        elif not ALLOW_UNVERIFIED_WEBHOOKS:
-            log("Webhook rejected: STRIPE_WEBHOOK_SECRET is not configured")
-            self._json(503, {"error": "webhook verification not configured"})
+        elif not UNSIGNED_LOCAL_TEST:
+            log("Webhook rejected: signature required; unsigned mode is loopback local/test only")
+            self._json(503, {"error": "webhook signature required"})
             return
         else:
-            log("WARNING: accepting unverified webhook because ALLOW_UNVERIFIED_WEBHOOKS=true")
+            log("WARNING: unsigned local-only test request accepted")
         try:
             event = json.loads(payload)
             if not isinstance(event, dict):
@@ -420,10 +437,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     init_db()
-    if not STRIPE_WEBHOOK_SECRET and not ALLOW_UNVERIFIED_WEBHOOKS:
-        log("STRIPE_WEBHOOK_SECRET missing: health checks pass, but webhooks are rejected")
-    log(f"Garcar Payments v2 listening on 0.0.0.0:{PORT}; database={DB_PATH}")
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    if not STRIPE_WEBHOOK_SECRET and not UNSIGNED_LOCAL_TEST:
+        log("STRIPE_WEBHOOK_SECRET missing: /ready returns 503 and webhooks are rejected")
+    if ALLOW_UNVERIFIED_WEBHOOKS and not UNSIGNED_LOCAL_TEST:
+        log("Unsigned test flag ignored outside loopback local/test environment")
+    log(f"Garcar Payments listening on {SERVER_HOST}:{PORT}")
+    ThreadingHTTPServer((SERVER_HOST, PORT), Handler).serve_forever()
 
 
 if __name__ == "__main__":
