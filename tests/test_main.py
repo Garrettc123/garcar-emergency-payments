@@ -404,6 +404,74 @@ class PaymentReceiverTests(unittest.TestCase):
         self.assertEqual(receipt["recurring"], 1)
         self.assertEqual(receipt["status"], "PAID_MANUAL_REVIEW")
 
+    def test_one_invoice_two_stripe_events_counts_once(self):
+        # Different signed Stripe Event IDs can refer to the same paid invoice.
+        # A payment intent might also be absent from modern invoice objects.
+        def invoice_event(event_id, payment_intent=None):
+            return {
+                "id": event_id,
+                "type": "invoice.paid",
+                "data": {"object": {
+                    "id": "in_stable_1",
+                    "payment_intent": payment_intent,
+                    "amount_paid": 49700,
+                    "currency": "usd",
+                    "billing_reason": "subscription_cycle",
+                    "metadata": {"sku": "GAR-CLOCK-MONTHLY"},
+                }},
+            }
+
+        first = invoice_event("evt_invoice_first", "pi_old_reference")
+        inserted, receipt = main.record_event(first, json.dumps(first).encode())
+        self.assertTrue(inserted)
+        self.assertEqual(receipt["payment_reference"], "invoice:in_stable_1")
+        self.assertEqual(receipt["recurring"], 1)
+
+        second = invoice_event("evt_invoice_second")
+        inserted, second_receipt = main.record_event(second, json.dumps(second).encode())
+        self.assertTrue(inserted)  # New event recorded for audit.
+        self.assertIsNone(second_receipt)  # Same invoice cannot be charged twice.
+        with main._connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM stripe_events").fetchone()[0], 2)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM payments").fetchone()[0], 1)
+        self.assertEqual(main.aggregate_revenue()["paid_events"], 1)
+
+    def test_distinct_subscription_invoices_are_not_suppressed(self):
+        # Renewals remain separate collections even on the same subscription.
+        for index in (1, 2):
+            event = {
+                "id": f"evt_sub_cycle_{index}",
+                "type": "invoice.paid",
+                "data": {"object": {
+                    "id": f"in_sub_cycle_{index}",
+                    "amount_paid": 49700,
+                    "currency": "usd",
+                    "billing_reason": "subscription_cycle",
+                    "metadata": {"sku": "GAR-CLOCK-MONTHLY"},
+                }},
+            }
+            inserted, receipt = main.record_event(event, json.dumps(event).encode())
+            self.assertTrue(inserted)
+            self.assertEqual(receipt["payment_reference"], f"invoice:in_sub_cycle_{index}")
+        self.assertEqual(main.aggregate_revenue()["paid_events"], 2)
+
+    def test_invoice_without_stable_id_cannot_create_payment(self):
+        event = {
+            "id": "evt_invoice_without_id",
+            "type": "invoice.paid",
+            "data": {"object": {
+                "amount_paid": 49700,
+                "currency": "usd",
+                "billing_reason": "subscription_cycle",
+                "metadata": {"sku": "GAR-CLOCK-MONTHLY"},
+            }},
+        }
+        self.assertIsNone(main.extract_payment(event))
+        inserted, receipt = main.record_event(event, json.dumps(event).encode())
+        self.assertTrue(inserted)  # Evidence of receipt is retained.
+        self.assertIsNone(receipt)
+        self.assertEqual(main.aggregate_revenue()["paid_events"], 0)
+
     def test_unpaid_checkout_is_not_queued(self):
         event = self.checkout_event("evt_unpaid")
         event["data"]["object"]["payment_status"] = "unpaid"
