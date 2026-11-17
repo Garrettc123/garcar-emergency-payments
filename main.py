@@ -346,8 +346,15 @@ def _hold_legacy_invoice_alias(
             linked.append(row)
     if not linked:
         return False
+    payments_list = obj.get("payments")
+    # New API snapshots can paginate invoice payments. Do not certify a
+    # one-payment match if the signed snapshot explicitly has more entries.
+    complete_list = not (
+        isinstance(payments_list, dict) and payments_list.get("has_more") is True
+    )
     exact = (
-        len(ids) == 1
+        complete_list
+        and len(ids) == 1
         and len(linked) == 1
         and linked[0]["amount_minor"] == payment["amount_minor"]
         and linked[0]["currency"] == payment["currency"]
@@ -560,6 +567,11 @@ def aggregate_revenue() -> dict:
             ORDER BY currency
             """
         ).fetchall()
+        alias_rows = connection.execute(
+            "SELECT reconciliation_state, COUNT(*) AS total "
+            "FROM payment_receipt_aliases GROUP BY reconciliation_state"
+        ).fetchall()
+    alias_counts = {row["reconciliation_state"]: row["total"] for row in alias_rows}
     by_currency = {
         row["currency"]: {
             "paid_events": row["paid_events"],
@@ -581,6 +593,7 @@ def aggregate_revenue() -> dict:
             (0 if not by_currency else None)
         ),
         "by_currency": by_currency,
+        "invoice_receipt_alias_counts": alias_counts,
         "currency_note": "Totals are grouped by currency; global minor-unit sums are omitted when currencies differ.",
         "mrr_note": "Recurring collections are not normalized MRR. Use Stripe Billing for authoritative MRR.",
     }
