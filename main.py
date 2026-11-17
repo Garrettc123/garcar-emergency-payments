@@ -79,6 +79,20 @@ def init_db() -> None:
                 FOREIGN KEY(event_id) REFERENCES stripe_events(event_id)
             );
             CREATE INDEX IF NOT EXISTS idx_payments_created_at ON payments(created_at);
+            -- Keep aliases without rewriting or destroying historic payment records.
+            -- This table records when a newly paid invoice corresponds to a
+            -- payment reference already persisted by the pre-upgrade receiver.
+            CREATE TABLE IF NOT EXISTS payment_receipt_aliases (
+                invoice_reference TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                legacy_reference TEXT NOT NULL,
+                reconciliation_state TEXT NOT NULL,
+                invoice_amount_minor INTEGER NOT NULL,
+                currency TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(event_id) REFERENCES stripe_events(event_id),
+                FOREIGN KEY(legacy_reference) REFERENCES payments(payment_reference)
+            );
             """
         )
         # Existing production volumes retain all payment evidence. Add lease
@@ -151,9 +165,38 @@ def metrics_authorized(authorization: str) -> bool:
     )
 
 
+def _invoice_is_recurring(obj: dict) -> bool:
+    """Recognize both modern and legacy Stripe subscription invoice shapes."""
+    parent = obj.get("parent")
+    if isinstance(parent, dict) and parent.get("type") == "subscription_details":
+        return True
+    if obj.get("subscription"):
+        return True
+    return str(obj.get("billing_reason") or "").startswith("subscription_")
+
+
 def _metadata(obj: dict) -> dict:
-    raw = obj.get("metadata") or {}
-    return raw if isinstance(raw, dict) else {}
+    """Use Stripe's immutable subscription metadata snapshot when present.
+
+    An invoice can have empty top-level metadata even when its subscription
+    identifies a product. Conflicting explicit SKUs require manual attribution.
+    """
+    direct = obj.get("metadata") or {}
+    direct = direct if isinstance(direct, dict) else {}
+    snapshot = {}
+    if _invoice_is_recurring(obj):
+        parent = obj.get("parent")
+        if isinstance(parent, dict) and parent.get("type") == "subscription_details":
+            details = parent.get("subscription_details") or {}
+        else:
+            details = obj.get("subscription_details") or {}
+        if isinstance(details, dict) and isinstance(details.get("metadata"), dict):
+            snapshot = details["metadata"]
+    direct_sku = str(direct.get("sku") or direct.get("offer_id") or "").strip()
+    snapshot_sku = str(snapshot.get("sku") or snapshot.get("offer_id") or "").strip()
+    if direct_sku and snapshot_sku and direct_sku != snapshot_sku:
+        return {"sku": "manual-review-conflicting-sku"}
+    return {**snapshot, **direct}
 
 
 def resolve_offer(obj: dict, amount_minor: int) -> dict:
@@ -194,23 +237,36 @@ def extract_payment(event: dict) -> dict | None:
     if not isinstance(obj, dict):
         return None
     if event_type.startswith("checkout.session"):
+        # Subscription Checkouts and their first paid invoice describe the
+        # same collection. Let invoice.paid be the sole subscription receipt
+        # to prevent double-counting and duplicate fulfillment notifications.
+        # One-time Checkout sessions continue through the normal paid gate.
+        if str(obj.get("mode") or "").lower() == "subscription":
+            return None
         if str(obj.get("payment_status") or "").lower() != "paid":
             return None
         amount_minor = _safe_int(obj.get("amount_total"))
         currency = str(obj.get("currency") or "usd").lower()
         customer_email = ((obj.get("customer_details") or {}).get("email") or obj.get("customer_email") or "")
-        payment_intent = str(obj.get("payment_intent") or obj.get("id") or "")
+        # For one-time Checkout, the payment intent identifies the collection;
+        # a Checkout session ID is a stable fallback if the intent is absent.
+        payment_reference = str(obj.get("payment_intent") or obj.get("id") or "").strip()
         recurring = False
     else:  # invoice.paid
         amount_minor = _safe_int(obj.get("amount_paid"))
         currency = str(obj.get("currency") or "usd").lower()
         customer_email = str(obj.get("customer_email") or "")
-        payment_intent = str(obj.get("payment_intent") or obj.get("id") or "")
-        recurring = True
-    if amount_minor <= 0:
+        # Invoice IDs are stable across different Stripe Event IDs (and do
+        # not change with webhook redelivery or invoice payment shapes).
+        # Do not fall back to an event ID or a payment_intent for invoice
+        # deduplication: those can count the same invoice more than once.
+        invoice_id = str(obj.get("id") or "").strip()
+        payment_reference = f"invoice:{invoice_id}" if invoice_id else ""
+        # Not every paid invoice is a recurring subscription collection.
+        recurring = _invoice_is_recurring(obj)
+    if amount_minor <= 0 or not payment_reference:
         return None
     offer = resolve_offer(obj, amount_minor)
-    payment_reference = payment_intent or f"{event.get('id')}-{amount_minor}"
     return {
         "payment_reference": payment_reference,
         "event_id": str(event.get("id") or ""),
@@ -229,6 +285,93 @@ def extract_payment(event: dict) -> dict | None:
     }
 
 
+def _invoice_payment_intent_ids(obj: dict) -> set[str]:
+    """Collect stable payment IDs from legacy and newer Stripe invoice shapes.
+
+    The newer invoice payments list can include failed attempts; only the
+    entries with paid status are eligible as evidence of the same collection.
+    """
+    ids: set[str] = set()
+    def add(value: object) -> None:
+        if isinstance(value, dict):
+            value = value.get("id")
+        if isinstance(value, str) and value.startswith("pi_"):
+            ids.add(value)
+
+    add(obj.get("payment_intent"))
+    payments = obj.get("payments")
+    if isinstance(payments, dict) and isinstance(payments.get("data"), list):
+        for entry in payments["data"][:100]:
+            if not isinstance(entry, dict) or entry.get("status") != "paid":
+                continue
+            payment = entry.get("payment")
+            if isinstance(payment, dict) and payment.get("type") == "payment_intent":
+                add(payment.get("payment_intent"))
+    return ids
+
+
+def _hold_legacy_invoice_alias(
+    connection: sqlite3.Connection, event: dict, payment: dict
+) -> bool:
+    """Prevent a historical payment-intent row being counted again as invoice:.
+
+    An exact amount/currency match is recorded as a linked alias; an ambiguous
+    collision is recorded as a reconciliation hold, not silently counted as
+    another collection. The event itself remains in stripe_events.
+    """
+    if event.get("type") != "invoice.paid":
+        return False
+    invoice_reference = payment["payment_reference"]
+    if not invoice_reference.startswith("invoice:"):
+        return False
+    if connection.execute(
+        "SELECT 1 FROM payment_receipt_aliases WHERE invoice_reference = ?",
+        (invoice_reference,),
+    ).fetchone():
+        return True
+    obj = (event.get("data") or {}).get("object") or {}
+    if not isinstance(obj, dict):
+        return False
+    ids = _invoice_payment_intent_ids(obj)
+    if not ids:
+        return False
+    linked = []
+    for payment_intent in sorted(ids):
+        row = connection.execute(
+            """SELECT payment_reference, amount_minor, currency
+               FROM payments WHERE payment_reference = ?""",
+            (payment_intent,),
+        ).fetchone()
+        if row:
+            linked.append(row)
+    if not linked:
+        return False
+    payments_list = obj.get("payments")
+    # New API snapshots can paginate invoice payments. Do not certify a
+    # one-payment match if the signed snapshot explicitly has more entries.
+    complete_list = not (
+        isinstance(payments_list, dict) and payments_list.get("has_more") is True
+    )
+    exact = (
+        complete_list
+        and len(ids) == 1
+        and len(linked) == 1
+        and linked[0]["amount_minor"] == payment["amount_minor"]
+        and linked[0]["currency"] == payment["currency"]
+    )
+    state = "MATCHED_LEGACY_RECEIPT" if exact else "MANUAL_RECONCILIATION"
+    connection.execute(
+        """INSERT OR IGNORE INTO payment_receipt_aliases(
+            invoice_reference, event_id, legacy_reference,
+            reconciliation_state, invoice_amount_minor, currency, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (invoice_reference, payment["event_id"], linked[0]["payment_reference"],
+         state, payment["amount_minor"], payment["currency"], utc_now()),
+    )
+    log(f"Invoice legacy receipt alias held state={state}")
+    return True
+
+
 def record_event(event: dict, payload: bytes) -> tuple[bool, dict | None]:
     event_id = str(event.get("id") or "").strip()
     event_type = str(event.get("type") or "").strip()
@@ -242,6 +385,10 @@ def record_event(event: dict, payload: bytes) -> tuple[bool, dict | None]:
         )
         if cursor.rowcount == 0:
             return False, None
+        if payment and _hold_legacy_invoice_alias(connection, event, payment):
+            # Existing paid PaymentIntent row is authoritative; never insert a
+            # second invoice row or deliver a second fulfillment notification.
+            payment = None
         if payment:
             payment_cursor = connection.execute(
                 """
@@ -420,6 +567,11 @@ def aggregate_revenue() -> dict:
             ORDER BY currency
             """
         ).fetchall()
+        alias_rows = connection.execute(
+            "SELECT reconciliation_state, COUNT(*) AS total "
+            "FROM payment_receipt_aliases GROUP BY reconciliation_state"
+        ).fetchall()
+    alias_counts = {row["reconciliation_state"]: row["total"] for row in alias_rows}
     by_currency = {
         row["currency"]: {
             "paid_events": row["paid_events"],
@@ -441,6 +593,7 @@ def aggregate_revenue() -> dict:
             (0 if not by_currency else None)
         ),
         "by_currency": by_currency,
+        "invoice_receipt_alias_counts": alias_counts,
         "currency_note": "Totals are grouped by currency; global minor-unit sums are omitted when currencies differ.",
         "mrr_note": "Recurring collections are not normalized MRR. Use Stripe Billing for authoritative MRR.",
     }
