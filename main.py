@@ -234,19 +234,25 @@ def extract_payment(event: dict) -> dict | None:
         amount_minor = _safe_int(obj.get("amount_total"))
         currency = str(obj.get("currency") or "usd").lower()
         customer_email = ((obj.get("customer_details") or {}).get("email") or obj.get("customer_email") or "")
-        payment_intent = str(obj.get("payment_intent") or obj.get("id") or "")
+        # For one-time Checkout, the payment intent identifies the collection;
+        # a Checkout session ID is a stable fallback if the intent is absent.
+        payment_reference = str(obj.get("payment_intent") or obj.get("id") or "").strip()
         recurring = False
     else:  # invoice.paid
         amount_minor = _safe_int(obj.get("amount_paid"))
         currency = str(obj.get("currency") or "usd").lower()
         customer_email = str(obj.get("customer_email") or "")
-        payment_intent = str(obj.get("payment_intent") or obj.get("id") or "")
+        # Invoice IDs are stable across different Stripe Event IDs (and do
+        # not change with webhook redelivery or invoice payment shapes).
+        # Do not fall back to an event ID or a payment_intent for invoice
+        # deduplication: those can count the same invoice more than once.
+        invoice_id = str(obj.get("id") or "").strip()
+        payment_reference = f"invoice:{invoice_id}" if invoice_id else ""
         # Not every paid invoice is a recurring subscription collection.
         recurring = _invoice_is_recurring(obj)
-    if amount_minor <= 0:
+    if amount_minor <= 0 or not payment_reference:
         return None
     offer = resolve_offer(obj, amount_minor)
-    payment_reference = payment_intent or f"{event.get('id')}-{amount_minor}"
     return {
         "payment_reference": payment_reference,
         "event_id": str(event.get("id") or ""),
