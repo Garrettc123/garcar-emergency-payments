@@ -608,6 +608,33 @@ class PaymentReceiverTests(unittest.TestCase):
         with main._connect() as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM payment_receipt_aliases").fetchone()[0], 0)
 
+    def test_partial_invoice_payment_list_requires_reconciliation(self):
+        self._legacy_paid_checkout(suffix="partial")
+        invoice = self._paid_invoice("evt_partial", suffix="partial", payment_id=False)
+        invoice["data"]["object"]["payments"] = {
+            "has_more": True,
+            "data": [{
+                "status": "paid",
+                "payment": {"type": "payment_intent", "payment_intent": "pi_legacy_partial"},
+            }],
+        }
+        saved, payment = main.record_event(invoice, json.dumps(invoice).encode())
+        self.assertTrue(saved)
+        self.assertIsNone(payment)
+        self.assertEqual(main.aggregate_revenue()["paid_events"], 1)
+        self.assertEqual(main.aggregate_revenue()["invoice_receipt_alias_counts"],
+                         {"MANUAL_RECONCILIATION": 1})
+
+    def test_legacy_alias_counts_are_private_aggregated_evidence(self):
+        self._legacy_paid_checkout(suffix="alias_count")
+        invoice = self._paid_invoice("evt_alias_count", suffix="alias_count")
+        main.record_event(invoice, json.dumps(invoice).encode())
+        report = main.aggregate_revenue()
+        self.assertEqual(report["invoice_receipt_alias_counts"],
+                         {"MATCHED_LEGACY_RECEIPT": 1})
+        self.assertEqual(report["paid_events"], 1)
+        self.assertNotIn("buyer@example.com", json.dumps(report))
+
     def test_new_invoice_with_new_payment_intent_remains_distinct(self):
         self._legacy_paid_checkout(suffix="renewal")
         invoice = self._paid_invoice("evt_renewal_new", suffix="renewal")
