@@ -238,6 +238,58 @@ class PaymentReceiverTests(unittest.TestCase):
             ).fetchone()["status"]
         self.assertEqual(state, "DELIVERY_MANUAL_INTERVENTION")
 
+    def test_subscription_checkout_and_invoice_count_once(self):
+        # A subscription's paid Checkout and initial paid invoice describe
+        # the same collection. The invoice is the sole payment ledger record.
+        checkout = self.checkout_event("evt_sub_checkout")
+        checkout["data"]["object"].update({
+            "mode": "subscription",
+            "payment_intent": None,
+            "subscription": "sub_1",
+            "amount_total": 49700,
+            "metadata": {"sku": "GAR-CLOCK-MONTHLY"},
+        })
+        self.assertIsNone(main.extract_payment(checkout))
+        inserted, receipt = main.record_event(checkout, json.dumps(checkout).encode())
+        self.assertTrue(inserted)
+        self.assertIsNone(receipt)
+        async_checkout = self.checkout_event("evt_sub_async")
+        async_checkout["type"] = "checkout.session.async_payment_succeeded"
+        async_checkout["data"]["object"]["mode"] = "subscription"
+        self.assertIsNone(main.extract_payment(async_checkout))
+        invoice = {
+            "id": "evt_sub_invoice",
+            "type": "invoice.paid",
+            "data": {"object": {
+                "id": "in_sub_1",
+                "payment_intent": "pi_sub_1",
+                "amount_paid": 49700,
+                "currency": "usd",
+                "customer_email": "buyer@example.com",
+                "metadata": {"sku": "GAR-CLOCK-MONTHLY"},
+            }},
+        }
+        inserted, receipt = main.record_event(invoice, json.dumps(invoice).encode())
+        self.assertTrue(inserted)
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt["recurring"], 1)
+        duplicate, second = main.record_event(invoice, json.dumps(invoice).encode())
+        self.assertFalse(duplicate)
+        self.assertIsNone(second)
+        summary = main.aggregate_revenue()
+        self.assertEqual(summary["paid_events"], 1)
+        self.assertEqual(summary["by_currency"]["usd"]["gross_collected_minor"], 49700)
+
+    def test_one_time_checkout_still_counts(self):
+        checkout = self.checkout_event("evt_one_time")
+        checkout["data"]["object"].update({
+            "mode": "payment",
+            "metadata": {"sku": "GAR-REVIEW-497"},
+        })
+        receipt = main.extract_payment(checkout)
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt["recurring"], 0)
+
     def test_unpaid_checkout_is_not_queued(self):
         event = self.checkout_event("evt_unpaid")
         event["data"]["object"]["payment_status"] = "unpaid"
