@@ -290,6 +290,113 @@ class PaymentReceiverTests(unittest.TestCase):
         self.assertIsNotNone(receipt)
         self.assertEqual(receipt["recurring"], 0)
 
+    def test_modern_subscription_invoice_uses_snapshot_sku(self):
+        invoice = {
+            "id": "evt_invoice_modern",
+            "type": "invoice.paid",
+            "data": {"object": {
+                "id": "in_modern",
+                "amount_paid": 49700,
+                "currency": "usd",
+                "metadata": {},
+                "parent": {
+                    "type": "subscription_details",
+                    "subscription_details": {
+                        "subscription": "sub_modern",
+                        "metadata": {
+                            "sku": "GAR-CLOCK-MONTHLY",
+                            "offer_name": "Callback Clock",
+                        },
+                    },
+                },
+            }},
+        }
+        receipt = main.extract_payment(invoice)
+        self.assertEqual(receipt["sku"], "GAR-CLOCK-MONTHLY")
+        self.assertEqual(receipt["status"], "PAID_PENDING_FULFILLMENT")
+        self.assertEqual(receipt["recurring"], 1)
+        self.assertEqual(json.loads(receipt["metadata_json"])["sku"], "GAR-CLOCK-MONTHLY")
+
+    def test_one_time_paid_invoice_is_not_recurring(self):
+        invoice = {
+            "id": "evt_one_time_invoice",
+            "type": "invoice.paid",
+            "data": {"object": {
+                "id": "in_one_time",
+                "amount_paid": 250000,
+                "currency": "usd",
+                "billing_reason": "manual",
+                "metadata": {"sku": "GAR-CLOCK-2500"},
+            }},
+        }
+        receipt = main.extract_payment(invoice)
+        self.assertEqual(receipt["recurring"], 0)
+        self.assertEqual(receipt["sku"], "GAR-CLOCK-2500")
+        self.assertEqual(receipt["status"], "PAID_PENDING_FULFILLMENT")
+
+    def test_conflicting_subscription_invoice_skus_require_manual_review(self):
+        invoice = {
+            "id": "evt_conflicting_invoice",
+            "type": "invoice.paid",
+            "data": {"object": {
+                "id": "in_conflicting",
+                "amount_paid": 49700,
+                "currency": "usd",
+                "metadata": {"sku": "OTHER-OFFER"},
+                "parent": {
+                    "type": "subscription_details",
+                    "subscription_details": {
+                        "subscription": "sub_conflicting",
+                        "metadata": {"sku": "GAR-CLOCK-MONTHLY"},
+                    },
+                },
+            }},
+        }
+        receipt = main.extract_payment(invoice)
+        self.assertEqual(receipt["status"], "PAID_MANUAL_REVIEW")
+        self.assertEqual(receipt["sku"], "manual-review-conflicting-sku")
+        self.assertTrue(main.requires_manual_review(receipt))
+
+    def test_legacy_subscription_invoice_metadata_is_supported(self):
+        invoice = {
+            "id": "evt_legacy_invoice",
+            "type": "invoice.paid",
+            "data": {"object": {
+                "id": "in_legacy",
+                "subscription": "sub_legacy",
+                "amount_paid": 49700,
+                "currency": "usd",
+                "subscription_details": {
+                    "metadata": {"sku": "GAR-CLOCK-MONTHLY"},
+                },
+            }},
+        }
+        receipt = main.extract_payment(invoice)
+        self.assertEqual(receipt["recurring"], 1)
+        self.assertEqual(receipt["sku"], "GAR-CLOCK-MONTHLY")
+
+    def test_unattributed_subscription_invoice_is_held(self):
+        invoice = {
+            "id": "evt_unattributed_invoice",
+            "type": "invoice.paid",
+            "data": {"object": {
+                "id": "in_unattributed",
+                "parent": {
+                    "type": "subscription_details",
+                    "subscription_details": {
+                        "subscription": "sub_unattributed",
+                        "metadata": {},
+                    },
+                },
+                "amount_paid": 49700,
+                "currency": "usd",
+                "metadata": {},
+            }},
+        }
+        receipt = main.extract_payment(invoice)
+        self.assertEqual(receipt["recurring"], 1)
+        self.assertEqual(receipt["status"], "PAID_MANUAL_REVIEW")
+
     def test_unpaid_checkout_is_not_queued(self):
         event = self.checkout_event("evt_unpaid")
         event["data"]["object"]["payment_status"] = "unpaid"
