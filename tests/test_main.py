@@ -512,6 +512,113 @@ class PaymentReceiverTests(unittest.TestCase):
             self.assertEqual(receipt["payment_reference"], f"invoice:in_sub_cycle_{index}")
         self.assertEqual(main.aggregate_revenue()["paid_events"], 2)
 
+    def _legacy_paid_checkout(self, suffix="same", amount=49700):
+        old = self.checkout_event("evt_legacy_" + suffix)
+        old["data"]["object"].update({
+            "id": "cs_legacy_" + suffix,
+            "payment_intent": "pi_legacy_" + suffix,
+            "amount_total": amount,
+            "metadata": {"sku": "RRS-497-WEEK"},
+        })
+        inserted, row = main.record_event(old, json.dumps(old).encode())
+        self.assertTrue(inserted)
+        self.assertIsNotNone(row)
+        return old
+
+    def _paid_invoice(self, event_id, suffix="same", amount=49700, payment_id=True):
+        obj = {
+            "id": "in_legacy_" + suffix,
+            "amount_paid": amount, "currency": "usd",
+            "billing_reason": "subscription_cycle",
+            "metadata": {"sku": "RRS-497-WEEK"},
+        }
+        if payment_id:
+            obj["payment_intent"] = "pi_legacy_" + suffix
+        return {"id": event_id, "type": "invoice.paid", "data": {"object": obj}}
+
+    def test_prior_checkout_receipt_does_not_double_count_paid_invoice(self):
+        self._legacy_paid_checkout()
+        invoice = self._paid_invoice("evt_paid_new_1")
+        saved, payment = main.record_event(invoice, json.dumps(invoice).encode())
+        self.assertTrue(saved)
+        self.assertIsNone(payment)
+        with main._connect() as db:
+            aliases = db.execute(
+                "SELECT * FROM payment_receipt_aliases WHERE invoice_reference = ?",
+                ("invoice:in_legacy_same",),
+            ).fetchall()
+            self.assertEqual(len(aliases), 1)
+            self.assertEqual(aliases[0]["legacy_reference"], "pi_legacy_same")
+            self.assertEqual(aliases[0]["reconciliation_state"], "MATCHED_LEGACY_RECEIPT")
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM stripe_events").fetchone()[0], 2)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM payments").fetchone()[0], 1)
+        self.assertEqual(main.aggregate_revenue()["paid_events"], 1)
+        self.assertEqual(main.aggregate_revenue()["gross_collected_minor"], 49700)
+
+    def test_later_invoice_event_without_pi_still_respects_persisted_alias(self):
+        self._legacy_paid_checkout()
+        original = self._paid_invoice("evt_paid_new_1")
+        main.record_event(original, json.dumps(original).encode())
+        main.init_db()  # Database migration/restart must not erase alias.
+        repeated = self._paid_invoice("evt_paid_new_2", payment_id=False)
+        saved, payment = main.record_event(repeated, json.dumps(repeated).encode())
+        self.assertTrue(saved)
+        self.assertIsNone(payment)
+        self.assertEqual(main.aggregate_revenue()["paid_events"], 1)
+        with main._connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM payment_receipt_aliases").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM stripe_events").fetchone()[0], 3)
+
+    def test_legacy_mismatched_amount_is_held_for_reconciliation(self):
+        self._legacy_paid_checkout(amount=49700)
+        invoice = self._paid_invoice("evt_bad_total", amount=149700)
+        saved, payment = main.record_event(invoice, json.dumps(invoice).encode())
+        self.assertTrue(saved)
+        self.assertIsNone(payment)
+        self.assertEqual(main.aggregate_revenue()["paid_events"], 1)
+        with main._connect() as db:
+            alias = db.execute(
+                "SELECT reconciliation_state, invoice_amount_minor FROM payment_receipt_aliases"
+            ).fetchone()
+        self.assertEqual(alias["reconciliation_state"], "MANUAL_RECONCILIATION")
+        self.assertEqual(alias["invoice_amount_minor"], 149700)
+
+    def test_modern_paid_invoice_payment_list_links_legacy_receipt(self):
+        self._legacy_paid_checkout(suffix="modern")
+        invoice = self._paid_invoice("evt_modern_1", suffix="modern", payment_id=False)
+        invoice["data"]["object"]["payments"] = {"data": [{
+            "status": "paid",
+            "payment": {"type": "payment_intent", "payment_intent": "pi_legacy_modern"},
+        }]}
+        saved, payment = main.record_event(invoice, json.dumps(invoice).encode())
+        self.assertTrue(saved)
+        self.assertIsNone(payment)
+        self.assertEqual(main.aggregate_revenue()["paid_events"], 1)
+
+    def test_failed_invoice_payment_attempt_is_not_legacy_alias(self):
+        self._legacy_paid_checkout(suffix="failed")
+        invoice = self._paid_invoice("evt_failed_candidate", suffix="failed", payment_id=False)
+        invoice["data"]["object"]["payments"] = {"data": [{
+            "status": "unpaid",
+            "payment": {"type": "payment_intent", "payment_intent": "pi_legacy_failed"},
+        }]}
+        saved, payment = main.record_event(invoice, json.dumps(invoice).encode())
+        self.assertTrue(saved)
+        self.assertIsNotNone(payment)
+        with main._connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM payment_receipt_aliases").fetchone()[0], 0)
+
+    def test_new_invoice_with_new_payment_intent_remains_distinct(self):
+        self._legacy_paid_checkout(suffix="renewal")
+        invoice = self._paid_invoice("evt_renewal_new", suffix="renewal")
+        invoice["data"]["object"]["id"] = "in_renewal_new"
+        invoice["data"]["object"]["payment_intent"] = "pi_renewal_new"
+        saved, payment = main.record_event(invoice, json.dumps(invoice).encode())
+        self.assertTrue(saved)
+        self.assertIsNotNone(payment)
+        self.assertEqual(payment["payment_reference"], "invoice:in_renewal_new")
+        self.assertEqual(main.aggregate_revenue()["paid_events"], 2)
+
     def test_invoice_without_stable_id_cannot_create_payment(self):
         event = {
             "id": "evt_invoice_without_id",
