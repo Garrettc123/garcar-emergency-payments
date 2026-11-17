@@ -79,6 +79,20 @@ def init_db() -> None:
                 FOREIGN KEY(event_id) REFERENCES stripe_events(event_id)
             );
             CREATE INDEX IF NOT EXISTS idx_payments_created_at ON payments(created_at);
+            -- Keep aliases without rewriting or destroying historic payment records.
+            -- This table records when a newly paid invoice corresponds to a
+            -- payment reference already persisted by the pre-upgrade receiver.
+            CREATE TABLE IF NOT EXISTS payment_receipt_aliases (
+                invoice_reference TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                legacy_reference TEXT NOT NULL,
+                reconciliation_state TEXT NOT NULL,
+                invoice_amount_minor INTEGER NOT NULL,
+                currency TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(event_id) REFERENCES stripe_events(event_id),
+                FOREIGN KEY(legacy_reference) REFERENCES payments(payment_reference)
+            );
             """
         )
         # Existing production volumes retain all payment evidence. Add lease
@@ -271,6 +285,86 @@ def extract_payment(event: dict) -> dict | None:
     }
 
 
+def _invoice_payment_intent_ids(obj: dict) -> set[str]:
+    """Collect stable payment IDs from legacy and newer Stripe invoice shapes.
+
+    The newer invoice payments list can include failed attempts; only the
+    entries with paid status are eligible as evidence of the same collection.
+    """
+    ids: set[str] = set()
+    def add(value: object) -> None:
+        if isinstance(value, dict):
+            value = value.get("id")
+        if isinstance(value, str) and value.startswith("pi_"):
+            ids.add(value)
+
+    add(obj.get("payment_intent"))
+    payments = obj.get("payments")
+    if isinstance(payments, dict) and isinstance(payments.get("data"), list):
+        for entry in payments["data"][:100]:
+            if not isinstance(entry, dict) or entry.get("status") != "paid":
+                continue
+            payment = entry.get("payment")
+            if isinstance(payment, dict) and payment.get("type") == "payment_intent":
+                add(payment.get("payment_intent"))
+    return ids
+
+
+def _hold_legacy_invoice_alias(
+    connection: sqlite3.Connection, event: dict, payment: dict
+) -> bool:
+    """Prevent a historical payment-intent row being counted again as invoice:.
+
+    An exact amount/currency match is recorded as a linked alias; an ambiguous
+    collision is recorded as a reconciliation hold, not silently counted as
+    another collection. The event itself remains in stripe_events.
+    """
+    if event.get("type") != "invoice.paid":
+        return False
+    invoice_reference = payment["payment_reference"]
+    if not invoice_reference.startswith("invoice:"):
+        return False
+    if connection.execute(
+        "SELECT 1 FROM payment_receipt_aliases WHERE invoice_reference = ?",
+        (invoice_reference,),
+    ).fetchone():
+        return True
+    obj = (event.get("data") or {}).get("object") or {}
+    if not isinstance(obj, dict):
+        return False
+    ids = _invoice_payment_intent_ids(obj)
+    if not ids:
+        return False
+    linked = []
+    for payment_intent in sorted(ids):
+        row = connection.execute(
+            """SELECT payment_reference, amount_minor, currency
+               FROM payments WHERE payment_reference = ?""",
+            (payment_intent,),
+        ).fetchone()
+        if row:
+            linked.append(row)
+    if not linked:
+        return False
+    exact = (
+        len(ids) == 1
+        and len(linked) == 1
+        and linked[0]["amount_minor"] == payment["amount_minor"]
+        and linked[0]["currency"] == payment["currency"]
+    )
+    state = "MATCHED_LEGACY_RECEIPT" if exact else "MANUAL_RECONCILIATION"
+    connection.execute(
+        """INSERT OR IGNORE INTO payment_receipt_aliases(
+            invoice_reference, event_id, legacy_reference,
+            reconciliation_state, invoice_amount_minor, currency, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (invoice_reference, payment["event_id"], linked[0]["payment_reference"],
+         state, payment["amount_minor"], payment["currency"], utc_now()),
+    )
+    log(f"Invoice legacy receipt alias held state={state}")
+    return True
+
+
 def record_event(event: dict, payload: bytes) -> tuple[bool, dict | None]:
     event_id = str(event.get("id") or "").strip()
     event_type = str(event.get("type") or "").strip()
@@ -284,6 +378,10 @@ def record_event(event: dict, payload: bytes) -> tuple[bool, dict | None]:
         )
         if cursor.rowcount == 0:
             return False, None
+        if payment and _hold_legacy_invoice_alias(connection, event, payment):
+            # Existing paid PaymentIntent row is authoritative; never insert a
+            # second invoice row or deliver a second fulfillment notification.
+            payment = None
         if payment:
             payment_cursor = connection.execute(
                 """
