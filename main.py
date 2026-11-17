@@ -151,9 +151,38 @@ def metrics_authorized(authorization: str) -> bool:
     )
 
 
+def _invoice_is_recurring(obj: dict) -> bool:
+    """Recognize both modern and legacy Stripe subscription invoice shapes."""
+    parent = obj.get("parent")
+    if isinstance(parent, dict) and parent.get("type") == "subscription_details":
+        return True
+    if obj.get("subscription"):
+        return True
+    return str(obj.get("billing_reason") or "").startswith("subscription_")
+
+
 def _metadata(obj: dict) -> dict:
-    raw = obj.get("metadata") or {}
-    return raw if isinstance(raw, dict) else {}
+    """Use Stripe's immutable subscription metadata snapshot when present.
+
+    An invoice can have empty top-level metadata even when its subscription
+    identifies a product. Conflicting explicit SKUs require manual attribution.
+    """
+    direct = obj.get("metadata") or {}
+    direct = direct if isinstance(direct, dict) else {}
+    snapshot = {}
+    if _invoice_is_recurring(obj):
+        parent = obj.get("parent")
+        if isinstance(parent, dict) and parent.get("type") == "subscription_details":
+            details = parent.get("subscription_details") or {}
+        else:
+            details = obj.get("subscription_details") or {}
+        if isinstance(details, dict) and isinstance(details.get("metadata"), dict):
+            snapshot = details["metadata"]
+    direct_sku = str(direct.get("sku") or direct.get("offer_id") or "").strip()
+    snapshot_sku = str(snapshot.get("sku") or snapshot.get("offer_id") or "").strip()
+    if direct_sku and snapshot_sku and direct_sku != snapshot_sku:
+        return {"sku": "manual-review-conflicting-sku"}
+    return {**snapshot, **direct}
 
 
 def resolve_offer(obj: dict, amount_minor: int) -> dict:
@@ -212,7 +241,8 @@ def extract_payment(event: dict) -> dict | None:
         currency = str(obj.get("currency") or "usd").lower()
         customer_email = str(obj.get("customer_email") or "")
         payment_intent = str(obj.get("payment_intent") or obj.get("id") or "")
-        recurring = True
+        # Not every paid invoice is a recurring subscription collection.
+        recurring = _invoice_is_recurring(obj)
     if amount_minor <= 0:
         return None
     offer = resolve_offer(obj, amount_minor)
