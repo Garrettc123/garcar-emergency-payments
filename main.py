@@ -426,31 +426,52 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"error": "database unavailable"})
             return
         if not inserted:
-            # Duplicate event: still attempt fulfillment if a pending payment exists for this event
-            # (covers prior failed notification that returned 200).
-            pending = None
-            if payment is None:
-                try:
-                    event_id = str(event.get("id") or "").strip()
-                    with _connect() as connection:
-                        row = connection.execute(
-                            "SELECT * FROM payments WHERE event_id = ? AND status = ? LIMIT 1",
-                            (event_id, "PAID_PENDING_FULFILLMENT"),
-                        ).fetchone()
-                        if row:
-                            pending = dict(row)
-                except sqlite3.Error as db_exc:
-                    log(f"Database lookup failed on duplicate event: {db_exc}")
-                    self._json(500, {"error": "database unavailable", "duplicate": True})
-                    return
-            if pending and FULFILLMENT_WEBHOOK_URL:
-                notified = notify_fulfillment(pending)
-                if not notified:
-                    self._json(502, {"received": True, "duplicate": True, "fulfillment_retry_failed": True})
-                    return
-                self._json(200, {"received": True, "duplicate": True, "fulfillment_notified": True})
+            # Stripe may redeliver an event after the receiver timed out.
+            # Only never-attempted pending rows may be dispatched again.
+            prior = None
+            try:
+                event_id = str(event.get("id") or "").strip()
+                with _connect() as connection:
+                    row = connection.execute(
+                        "SELECT * FROM payments WHERE event_id = ? LIMIT 1",
+                        (event_id,),
+                    ).fetchone()
+                    if row:
+                        prior = dict(row)
+            except sqlite3.Error as exc:
+                log(f"Duplicate-event payment state lookup failed: {type(exc).__name__}")
+                self._json(500, {"error": "database unavailable", "duplicate": True})
                 return
-            self._json(200, {"received": True, "duplicate": True})
+            if prior and prior["status"] in (
+                    "FULFILLMENT_ATTEMPTING", "FULFILLMENT_OUTCOME_UNKNOWN"):
+                self._json(200, {
+                    "received": True, "duplicate": True,
+                    "manual_reconciliation_required": True,
+                    "fulfillment_status": prior["status"],
+                })
+                return
+            if prior and prior["status"] == "FULFILLMENT_NOTIFIED":
+                self._json(200, {
+                    "received": True, "duplicate": True,
+                    "fulfillment_notified": True,
+                })
+                return
+            if (prior and prior["status"] == "PAID_PENDING_FULFILLMENT"
+                    and FULFILLMENT_WEBHOOK_URL):
+                if notify_fulfillment(prior):
+                    self._json(200, {
+                        "received": True, "duplicate": True,
+                        "fulfillment_notified": True,
+                    })
+                    return
+                self._json(200, {
+                    "received": True, "duplicate": True,
+                    "manual_reconciliation_required": True,
+                    "note": "Fulfillment delivery not confirmed; inspect outcome status.",
+                })
+                return
+            self._json(200, {"received": True, "duplicate": True,
+                             "payment_pending_manual_fulfillment": bool(prior)})
             return
         notified = notify_fulfillment(payment) if payment else False
         if payment:
@@ -461,7 +482,7 @@ class Handler(BaseHTTPRequestHandler):
                     "received": True,
                     "payment_queued": True,
                     "fulfillment_notified": False,
-                    "error": "fulfillment notification failed — will retry on Stripe redelivery",
+                    "error": "fulfillment delivery unconfirmed — reconcile before any retry",
                 })
                 return
         self._json(200, {
