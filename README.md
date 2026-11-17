@@ -95,6 +95,41 @@ Also set `offer_name` and `fulfill_hours` when the offer differs from the amount
 | GET | `/mrr` | Backward-compatible alias for `/revenue` |
 | POST | `/stripe-webhook` | Verified Stripe event intake |
 
+## Webhook and fulfillment failure boundaries
+
+The receiver distinguishes liveness from signature readiness:
+- GET /health reports process liveness, signing posture and fulfillment
+  configuration without exposing the SQLite internal path.
+- GET /ready returns HTTP 503 if the Stripe signing secret is missing.
+- GET /fulfillment-status returns aggregate counts of pending, attempting,
+  unknown-outcome and notified payments, without customer identifiers.
+
+Production webhook events always require verified Stripe signatures.
+The flag ALLOW_UNVERIFIED_WEBHOOKS=true has no effect on a production listener.
+For deliberate unsigned testing, ALL of these must be set:
+
+    GARCAR_ENVIRONMENT=local HOST=127.0.0.1 ALLOW_UNVERIFIED_WEBHOOKS=true python main.py
+
+Never deploy that local-only invocation to a public endpoint.
+
+**Ambiguous fulfillment outcomes:** a downstream receiver may execute an
+action but lose its response. Blind replay can cause duplicate delivery.
+The receiver reserves an attempt in SQLite; it marks FULFILLMENT_NOTIFIED
+only after confirmed 2xx. A timeout/non-2xx becomes
+FULFILLMENT_OUTCOME_UNKNOWN; a crash during dispatch remains
+FULFILLMENT_ATTEMPTING. Both require human reconciliation with the
+downstream idempotency key before a retry. Duplicate Stripe events do not
+auto-dispatch these uncertain states.
+
+This favors fail-closed delivery over unverified duplicate fulfillment,
+but does not imply every valid payment was fulfilled. Maintain a monitored
+reconciliation queue and an idempotent fulfillment target.
+
+**Release boundary:** this PR changes source code and local tests only.
+No live Stripe endpoints, deployment, secrets, or fulfillment target were
+altered. Verify signature configuration, delivery logs and the
+persisted /data volume before routing paid traffic.
+
 ## Deployment gate
 
 Do not send paid traffic until all of these pass:

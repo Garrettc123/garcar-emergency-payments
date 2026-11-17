@@ -15,6 +15,15 @@ from urllib.request import Request, urlopen
 PORT = int(os.environ.get("PORT", "8080"))
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 ALLOW_UNVERIFIED_WEBHOOKS = os.environ.get("ALLOW_UNVERIFIED_WEBHOOKS", "false").lower() == "true"
+GARCAR_ENVIRONMENT = os.environ.get("GARCAR_ENVIRONMENT", "production").strip().lower()
+SERVER_HOST = os.environ.get("HOST", "0.0.0.0").strip()
+# Unsigned events are permissible ONLY on a loopback listener in local/test.
+# A production host setting always requires Stripe signature verification.
+UNSIGNED_LOCAL_TEST = (
+    ALLOW_UNVERIFIED_WEBHOOKS
+    and GARCAR_ENVIRONMENT in {"local", "test"}
+    and SERVER_HOST == "127.0.0.1"
+)
 FULFILLMENT_WEBHOOK_URL = os.environ.get("FULFILLMENT_WEBHOOK_URL", "")
 FULFILLMENT_WEBHOOK_TOKEN = os.environ.get("FULFILLMENT_WEBHOOK_TOKEN", "")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
@@ -220,13 +229,12 @@ def record_event(event: dict, payload: bytes) -> tuple[bool, dict | None]:
     return True, payment
 
 
-def mark_fulfillment_notified(payment_reference: str) -> bool:
-    """Atomically transition a pending payment to FULFILLMENT_NOTIFIED. Returns True if claimed."""
+def reserve_fulfillment_attempt(payment_reference: str) -> bool:
+    """Claim one handoff attempt; crash never falsely marks it delivered."""
     with _connect() as connection:
         cursor = connection.execute(
             """
-            UPDATE payments
-            SET status = 'FULFILLMENT_NOTIFIED'
+            UPDATE payments SET status = 'FULFILLMENT_ATTEMPTING'
             WHERE payment_reference = ? AND status = 'PAID_PENDING_FULFILLMENT'
             """,
             (payment_reference,),
@@ -234,16 +242,55 @@ def mark_fulfillment_notified(payment_reference: str) -> bool:
         return cursor.rowcount == 1
 
 
+def finish_fulfillment_attempt(payment_reference: str, *, confirmed: bool) -> None:
+    """Unknown outcomes require reconciliation; never retry blindly."""
+    status = "FULFILLMENT_NOTIFIED" if confirmed else "FULFILLMENT_OUTCOME_UNKNOWN"
+    with _connect() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE payments SET status = ?
+            WHERE payment_reference = ? AND status = 'FULFILLMENT_ATTEMPTING'
+            """,
+            (status, payment_reference),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeError("fulfillment state transition lost or already consumed")
+
+
+def fulfillment_summary() -> dict:
+    """No PII; status counts for manual reconciliation and monitoring."""
+    with _connect() as connection:
+        rows = connection.execute(
+            "SELECT status, COUNT(*) AS count FROM payments GROUP BY status"
+        ).fetchall()
+    counts = {row["status"]: row["count"] for row in rows}
+    return {
+        "paid_pending_fulfillment": counts.get("PAID_PENDING_FULFILLMENT", 0),
+        "fulfillment_attempting": counts.get("FULFILLMENT_ATTEMPTING", 0),
+        "fulfillment_outcome_unknown": counts.get("FULFILLMENT_OUTCOME_UNKNOWN", 0),
+        "fulfillment_notified": counts.get("FULFILLMENT_NOTIFIED", 0),
+        "no_customer_identifiers": True,
+        "note": "Notification does not mean service was delivered; reconcile unknown outcomes before retry.",
+    }
+
+
 def notify_fulfillment(payment: dict) -> bool:
     if not FULFILLMENT_WEBHOOK_URL:
         return False
-    if not FULFILLMENT_WEBHOOK_URL.startswith("https://"):
-        log("FULFILLMENT_WEBHOOK_URL rejected: HTTPS is required")
+    try:
+        target = urlparse(FULFILLMENT_WEBHOOK_URL)
+        if (target.scheme != "https" or not target.hostname
+                or target.username is not None or target.password is not None
+                or target.hostname.lower() in {"localhost", "127.0.0.1", "::1"}
+                or target.fragment):
+            log("Fulfillment target rejected: must be a nonlocal HTTPS endpoint")
+            return False
+    except ValueError:
+        log("Fulfillment target rejected: invalid URL")
         return False
-    # Claim first so concurrent/redelivered events cannot double-notify.
-    if not mark_fulfillment_notified(payment["payment_reference"]):
-        log(f"Fulfillment already claimed or not pending: {payment['payment_reference']}")
-        return True  # Treat as success; already handled.
+    if not reserve_fulfillment_attempt(payment["payment_reference"]):
+        log("Fulfillment already attempted; requires state reconciliation before resending")
+        return False
     payload = {
         "event": "garcar.payment.received",
         "payment_reference": payment["payment_reference"],
@@ -259,30 +306,26 @@ def notify_fulfillment(payment: dict) -> bool:
     body = json.dumps(payload).encode()
     headers = {
         "Content-Type": "application/json",
-        "User-Agent": "garcar-payments/2.0",
+        "User-Agent": "garcar-payments/2.1",
         "Idempotency-Key": payment["payment_reference"],
     }
     if FULFILLMENT_WEBHOOK_TOKEN:
         headers["Authorization"] = f"Bearer {FULFILLMENT_WEBHOOK_TOKEN}"
+    confirmed = False
     try:
-        with urlopen(Request(FULFILLMENT_WEBHOOK_URL, data=body, headers=headers, method="POST"), timeout=10) as response:
-            ok = 200 <= response.status < 300
-            if not ok:
-                # Revert claim so Stripe redelivery can retry.
-                with _connect() as connection:
-                    connection.execute(
-                        "UPDATE payments SET status = 'PAID_PENDING_FULFILLMENT' WHERE payment_reference = ?",
-                        (payment["payment_reference"],),
-                    )
-            return ok
+        with urlopen(
+            Request(FULFILLMENT_WEBHOOK_URL, data=body, headers=headers, method="POST"),
+            timeout=10,
+        ) as response:
+            confirmed = 200 <= response.status < 300
     except Exception as exc:
-        log(f"Fulfillment notification failed: {type(exc).__name__}")
-        with _connect() as connection:
-            connection.execute(
-                "UPDATE payments SET status = 'PAID_PENDING_FULFILLMENT' WHERE payment_reference = ?",
-                (payment["payment_reference"],),
-            )
-        return False
+        # Network timeout, reset, non-2xx HTTP: the remote side might still
+        # have applied the action. Failing open and auto-retrying could
+        # duplicate client fulfillment.
+        log(f"Fulfillment notification outcome unknown: {type(exc).__name__}")
+    finally:
+        finish_fulfillment_attempt(payment["payment_reference"], confirmed=confirmed)
+    return confirmed
 
 
 def aggregate_revenue() -> dict:
@@ -322,13 +365,23 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/health":
             self._json(200, {
-                "ok": True,
-                "webhook_verification": bool(STRIPE_WEBHOOK_SECRET) or ALLOW_UNVERIFIED_WEBHOOKS,
+                "alive": True,
+                "webhook_signature_configured": bool(STRIPE_WEBHOOK_SECRET),
+                "unsigned_local_test_enabled": bool(UNSIGNED_LOCAL_TEST),
                 "fulfillment_configured": bool(FULFILLMENT_WEBHOOK_URL),
-                "database": str(DB_PATH),
+                "ready_for_live_webhooks": bool(STRIPE_WEBHOOK_SECRET),
+            })
+        elif path == "/ready":
+            configured = bool(STRIPE_WEBHOOK_SECRET)
+            self._json(200 if configured else 503, {
+                "ready": configured,
+                "reason": "signature_configured" if configured
+                          else "stripe_webhook_signing_secret_missing",
             })
         elif path in ("/revenue", "/mrr"):
             self._json(200, aggregate_revenue())
+        elif path == "/fulfillment-status":
+            self._json(200, fulfillment_summary())
         else:
             self._json(404, {"error": "not found"})
 
@@ -350,12 +403,12 @@ class Handler(BaseHTTPRequestHandler):
             if not verify_stripe_signature(payload, signature, STRIPE_WEBHOOK_SECRET):
                 self._json(400, {"error": "invalid signature"})
                 return
-        elif not ALLOW_UNVERIFIED_WEBHOOKS:
-            log("Webhook rejected: STRIPE_WEBHOOK_SECRET is not configured")
-            self._json(503, {"error": "webhook verification not configured"})
+        elif not UNSIGNED_LOCAL_TEST:
+            log("Webhook rejected: signature required; unsigned mode is loopback local/test only")
+            self._json(503, {"error": "webhook signature required"})
             return
         else:
-            log("WARNING: accepting unverified webhook because ALLOW_UNVERIFIED_WEBHOOKS=true")
+            log("WARNING: unsigned local-only test request accepted")
         try:
             event = json.loads(payload)
             if not isinstance(event, dict):
@@ -373,31 +426,52 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"error": "database unavailable"})
             return
         if not inserted:
-            # Duplicate event: still attempt fulfillment if a pending payment exists for this event
-            # (covers prior failed notification that returned 200).
-            pending = None
-            if payment is None:
-                try:
-                    event_id = str(event.get("id") or "").strip()
-                    with _connect() as connection:
-                        row = connection.execute(
-                            "SELECT * FROM payments WHERE event_id = ? AND status = ? LIMIT 1",
-                            (event_id, "PAID_PENDING_FULFILLMENT"),
-                        ).fetchone()
-                        if row:
-                            pending = dict(row)
-                except sqlite3.Error as db_exc:
-                    log(f"Database lookup failed on duplicate event: {db_exc}")
-                    self._json(500, {"error": "database unavailable", "duplicate": True})
-                    return
-            if pending and FULFILLMENT_WEBHOOK_URL:
-                notified = notify_fulfillment(pending)
-                if not notified:
-                    self._json(502, {"received": True, "duplicate": True, "fulfillment_retry_failed": True})
-                    return
-                self._json(200, {"received": True, "duplicate": True, "fulfillment_notified": True})
+            # Stripe may redeliver an event after the receiver timed out.
+            # Only never-attempted pending rows may be dispatched again.
+            prior = None
+            try:
+                event_id = str(event.get("id") or "").strip()
+                with _connect() as connection:
+                    row = connection.execute(
+                        "SELECT * FROM payments WHERE event_id = ? LIMIT 1",
+                        (event_id,),
+                    ).fetchone()
+                    if row:
+                        prior = dict(row)
+            except sqlite3.Error as exc:
+                log(f"Duplicate-event payment state lookup failed: {type(exc).__name__}")
+                self._json(500, {"error": "database unavailable", "duplicate": True})
                 return
-            self._json(200, {"received": True, "duplicate": True})
+            if prior and prior["status"] in (
+                    "FULFILLMENT_ATTEMPTING", "FULFILLMENT_OUTCOME_UNKNOWN"):
+                self._json(200, {
+                    "received": True, "duplicate": True,
+                    "manual_reconciliation_required": True,
+                    "fulfillment_status": prior["status"],
+                })
+                return
+            if prior and prior["status"] == "FULFILLMENT_NOTIFIED":
+                self._json(200, {
+                    "received": True, "duplicate": True,
+                    "fulfillment_notified": True,
+                })
+                return
+            if (prior and prior["status"] == "PAID_PENDING_FULFILLMENT"
+                    and FULFILLMENT_WEBHOOK_URL):
+                if notify_fulfillment(prior):
+                    self._json(200, {
+                        "received": True, "duplicate": True,
+                        "fulfillment_notified": True,
+                    })
+                    return
+                self._json(200, {
+                    "received": True, "duplicate": True,
+                    "manual_reconciliation_required": True,
+                    "note": "Fulfillment delivery not confirmed; inspect outcome status.",
+                })
+                return
+            self._json(200, {"received": True, "duplicate": True,
+                             "payment_pending_manual_fulfillment": bool(prior)})
             return
         notified = notify_fulfillment(payment) if payment else False
         if payment:
@@ -408,7 +482,7 @@ class Handler(BaseHTTPRequestHandler):
                     "received": True,
                     "payment_queued": True,
                     "fulfillment_notified": False,
-                    "error": "fulfillment notification failed — will retry on Stripe redelivery",
+                    "error": "fulfillment delivery unconfirmed — reconcile before any retry",
                 })
                 return
         self._json(200, {
@@ -420,10 +494,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     init_db()
-    if not STRIPE_WEBHOOK_SECRET and not ALLOW_UNVERIFIED_WEBHOOKS:
-        log("STRIPE_WEBHOOK_SECRET missing: health checks pass, but webhooks are rejected")
-    log(f"Garcar Payments v2 listening on 0.0.0.0:{PORT}; database={DB_PATH}")
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    if not STRIPE_WEBHOOK_SECRET and not UNSIGNED_LOCAL_TEST:
+        log("STRIPE_WEBHOOK_SECRET missing: /ready returns 503 and webhooks are rejected")
+    if ALLOW_UNVERIFIED_WEBHOOKS and not UNSIGNED_LOCAL_TEST:
+        log("Unsigned test flag ignored outside loopback local/test environment")
+    log(f"Garcar Payments listening on {SERVER_HOST}:{PORT}")
+    ThreadingHTTPServer((SERVER_HOST, PORT), Handler).serve_forever()
 
 
 if __name__ == "__main__":
