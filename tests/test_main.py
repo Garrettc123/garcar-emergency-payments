@@ -267,6 +267,13 @@ class PaymentReceiverTests(unittest.TestCase):
                 "currency": "usd",
                 "customer_email": "buyer@example.com",
                 "metadata": {"sku": "GAR-CLOCK-MONTHLY"},
+                "parent": {
+                    "type": "subscription_details",
+                    "subscription_details": {
+                        "subscription": "sub_1",
+                        "metadata": {"sku": "GAR-CLOCK-MONTHLY"},
+                    },
+                },
             }},
         }
         inserted, receipt = main.record_event(invoice, json.dumps(invoice).encode())
