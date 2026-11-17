@@ -194,6 +194,12 @@ def extract_payment(event: dict) -> dict | None:
     if not isinstance(obj, dict):
         return None
     if event_type.startswith("checkout.session"):
+        # Subscription Checkouts and their first paid invoice describe the
+        # same collection. Let invoice.paid be the sole subscription receipt
+        # to prevent double-counting and duplicate fulfillment notifications.
+        # One-time Checkout sessions continue through the normal paid gate.
+        if str(obj.get("mode") or "").lower() == "subscription":
+            return None
         if str(obj.get("payment_status") or "").lower() != "paid":
             return None
         amount_minor = _safe_int(obj.get("amount_total"))
