@@ -110,6 +110,69 @@ class PaymentReceiverTests(unittest.TestCase):
         with patch.object(main, "METRICS_READ_TOKEN", ""):
             self.assertFalse(main.metrics_authorized("Bearer long-read-only-metrics-token"))
 
+    def test_private_metrics_http_routes_fail_closed(self):
+        class Capture:
+            def __init__(self, path, auth):
+                self.path = path
+                self.headers = {"Authorization": auth}
+                self.responses = []
+
+            def _json(self, status, body):
+                self.responses.append((status, body))
+
+        for path in ("/revenue", "/mrr", "/fulfillment-status"):
+            with self.subTest(path=path):
+                with patch.object(main, "METRICS_READ_TOKEN", ""):
+                    handler = Capture(path, "")
+                    main.Handler.do_GET(handler)
+                    self.assertEqual(handler.responses[0][0], 503)
+                with patch.object(main, "METRICS_READ_TOKEN", "protected-token"):
+                    handler = Capture(path, "Bearer wrong")
+                    main.Handler.do_GET(handler)
+                    self.assertEqual(handler.responses[0][0], 403)
+                    handler = Capture(path, "Bearer protected-token")
+                    main.Handler.do_GET(handler)
+                    self.assertEqual(handler.responses[0][0], 200)
+
+    def test_signed_unattributed_webhook_acknowledges_manual_hold(self):
+        from io import BytesIO
+        event = self.checkout_event("evt_signed_manual_hold")
+        event["livemode"] = True
+        event["data"]["object"]["amount_total"] = 49700
+        event["data"]["object"]["payment_intent"] = "pi_signed_manual_hold"
+        payload = json.dumps(event).encode()
+        timestamp = int(time.time())
+        signature = hmac.new(
+            b"whsec_local_fixture",
+            f"{timestamp}.".encode() + payload,
+            hashlib.sha256,
+        ).hexdigest()
+
+        class Capture:
+            path = "/stripe-webhook"
+            headers = {
+                "Content-Length": str(len(payload)),
+                "Stripe-Signature": f"t={timestamp},v1={signature}",
+            }
+            rfile = BytesIO(payload)
+
+            def __init__(self):
+                self.responses = []
+
+            def _json(self, status, body):
+                self.responses.append((status, body))
+
+        with patch.object(main, "STRIPE_WEBHOOK_SECRET", "whsec_local_fixture"):
+            with patch.object(main, "FULFILLMENT_WEBHOOK_URL", "https://internal.example/fulfill"):
+                with patch.object(main, "urlopen", side_effect=AssertionError("must not call")):
+                    handler = Capture()
+                    main.Handler.do_POST(handler)
+        status, body = handler.responses[0]
+        self.assertEqual(status, 200)
+        self.assertTrue(body["manual_review_required"])
+        self.assertFalse(body["fulfillment_notified"])
+        self.assertEqual(main.fulfillment_summary()["paid_manual_review"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
