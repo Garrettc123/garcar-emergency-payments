@@ -14,6 +14,7 @@ from urllib.request import Request, urlopen
 
 PORT = int(os.environ.get("PORT", "8080"))
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+METRICS_READ_TOKEN = os.environ.get("METRICS_READ_TOKEN", "")
 ALLOW_UNVERIFIED_WEBHOOKS = os.environ.get("ALLOW_UNVERIFIED_WEBHOOKS", "false").lower() == "true"
 GARCAR_ENVIRONMENT = os.environ.get("GARCAR_ENVIRONMENT", "production").strip().lower()
 SERVER_HOST = os.environ.get("HOST", "0.0.0.0").strip()
@@ -117,6 +118,13 @@ def verify_stripe_signature(payload: bytes, signature_header: str, secret: str, 
     return any(hmac.compare_digest(expected, candidate) for candidate in signatures)
 
 
+def metrics_authorized(authorization: str) -> bool:
+    """Compare the complete metrics bearer token without exposing its value."""
+    if not METRICS_READ_TOKEN or not authorization.startswith("Bearer "):
+        return False
+    return hmac.compare_digest(authorization[7:], METRICS_READ_TOKEN)
+
+
 def _safe_int(value, default: int = 0) -> int:
     try:
         return int(value)
@@ -190,7 +198,8 @@ def extract_payment(event: dict) -> dict | None:
         "fulfill_hours": offer["fulfill_hours"],
         "session_id": str(obj.get("id") or ""),
         "recurring": 1 if recurring else 0,
-        "status": "PAID_PENDING_FULFILLMENT",
+        "status": ("PAID_MANUAL_REVIEW" if offer["sku"].startswith("manual-review-")
+                   or offer["sku"] == "metadata-offer" else "PAID_PENDING_FULFILLMENT"),
         "created_at": utc_now(),
         "metadata_json": json.dumps(_metadata(obj), sort_keys=True),
     }
@@ -266,6 +275,7 @@ def fulfillment_summary() -> dict:
     counts = {row["status"]: row["count"] for row in rows}
     return {
         "paid_pending_fulfillment": counts.get("PAID_PENDING_FULFILLMENT", 0),
+        "paid_manual_review": counts.get("PAID_MANUAL_REVIEW", 0),
         "fulfillment_attempting": counts.get("FULFILLMENT_ATTEMPTING", 0),
         "fulfillment_outcome_unknown": counts.get("FULFILLMENT_OUTCOME_UNKNOWN", 0),
         "fulfillment_notified": counts.get("FULFILLMENT_NOTIFIED", 0),
@@ -275,6 +285,9 @@ def fulfillment_summary() -> dict:
 
 
 def notify_fulfillment(payment: dict) -> bool:
+    # An untagged or name-only payment must never trigger an external handoff.
+    if payment.get("status") != "PAID_PENDING_FULFILLMENT":
+        return False
     if not FULFILLMENT_WEBHOOK_URL:
         return False
     try:
@@ -363,6 +376,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        if path in ("/revenue", "/mrr", "/fulfillment-status"):
+            if not METRICS_READ_TOKEN:
+                self._json(503, {"error": "private metrics not configured"})
+                return
+            if not metrics_authorized(self.headers.get("Authorization", "")):
+                self._json(403, {"error": "forbidden"})
+                return
         if path == "/health":
             self._json(200, {
                 "alive": True,
@@ -476,7 +496,8 @@ class Handler(BaseHTTPRequestHandler):
         notified = notify_fulfillment(payment) if payment else False
         if payment:
             log(f"PAYMENT QUEUED reference={payment['payment_reference']} sku={payment['sku']} amount_minor={payment['amount_minor']}")
-            if FULFILLMENT_WEBHOOK_URL and not notified:
+            if (FULFILLMENT_WEBHOOK_URL and payment["status"] == "PAID_PENDING_FULFILLMENT"
+                    and not notified):
                 # Return non-2xx so Stripe retries; payment row already persisted.
                 self._json(502, {
                     "received": True,
@@ -488,6 +509,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {
             "received": True,
             "payment_queued": bool(payment),
+            "manual_review_required": bool(payment and payment["status"] == "PAID_MANUAL_REVIEW"),
             "fulfillment_notified": notified,
         })
 
