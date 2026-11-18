@@ -4,6 +4,7 @@ import json
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import main
@@ -83,7 +84,6 @@ class PaymentReceiverTests(unittest.TestCase):
         self.assertIsNone(main.extract_payment(event))
 
     def test_unattributed_payment_is_held_without_handoff(self):
-        from unittest.mock import patch
         event = self.checkout_event("evt_held_497")
         event["data"]["object"]["amount_total"] = 49700
         event["data"]["object"]["payment_intent"] = "pi_held_497"
@@ -102,12 +102,12 @@ class PaymentReceiverTests(unittest.TestCase):
         self.assertEqual(main.extract_payment(event)["status"], "PAID_MANUAL_REVIEW")
 
     def test_private_metrics_bearer_check(self):
-        with unittest.mock.patch.object(main, "METRICS_READ_TOKEN", "long-read-only-metrics-token"):
+        with patch.object(main, "METRICS_READ_TOKEN", "long-read-only-metrics-token"):
             self.assertFalse(main.metrics_authorized(""))
             self.assertFalse(main.metrics_authorized("Bearer incorrect"))
             self.assertFalse(main.metrics_authorized("Basic long-read-only-metrics-token"))
             self.assertTrue(main.metrics_authorized("Bearer long-read-only-metrics-token"))
-        with unittest.mock.patch.object(main, "METRICS_READ_TOKEN", ""):
+        with patch.object(main, "METRICS_READ_TOKEN", ""):
             self.assertFalse(main.metrics_authorized("Bearer long-read-only-metrics-token"))
 
 
