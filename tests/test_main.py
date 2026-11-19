@@ -110,6 +110,20 @@ class PaymentReceiverTests(unittest.TestCase):
         with patch.object(main, "METRICS_READ_TOKEN", ""):
             self.assertFalse(main.metrics_authorized("Bearer long-read-only-metrics-token"))
 
+    def test_downstream_handoff_requires_bearer_token(self):
+        event = self.checkout_event("evt_withheld_no_token")
+        event["data"]["object"]["metadata"] = {
+            "sku": "approved-contract-review",
+            "offer_name": "Approved Contract Review",
+        }
+        payment = main.extract_payment(event)
+        self.assertEqual(payment["status"], "PAID_PENDING_FULFILLMENT")
+        with patch.object(main, "FULFILLMENT_WEBHOOK_URL", "https://internal.example/fulfill"):
+            with patch.object(main, "FULFILLMENT_WEBHOOK_TOKEN", ""):
+                with patch.object(main, "urlopen", side_effect=AssertionError("must not send")):
+                    self.assertFalse(main.notify_fulfillment(payment))
+        self.assertEqual(main.fulfillment_summary()["fulfillment_attempting"], 0)
+
     def test_private_metrics_http_routes_fail_closed(self):
         class Capture:
             def __init__(self, path, auth):
