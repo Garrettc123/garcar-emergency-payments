@@ -290,6 +290,12 @@ def notify_fulfillment(payment: dict) -> bool:
         return False
     if not FULFILLMENT_WEBHOOK_URL:
         return False
+    # Never send buyer identity, payment references or order details without
+    # authenticating the downstream receiver. If credentials are missing,
+    # preserve the pending row for an explicitly authorized later retry.
+    if not FULFILLMENT_WEBHOOK_TOKEN:
+        log("Fulfillment withheld: downstream bearer token not configured")
+        return False
     try:
         target = urlparse(FULFILLMENT_WEBHOOK_URL)
         if (target.scheme != "https" or not target.hostname
