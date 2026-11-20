@@ -349,6 +349,8 @@ def aggregate_revenue() -> dict:
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "GarcarPayments/2.0"
+    expected_livemode = True
+    wrong_mode_reason = "non_live_event"
 
     def log_message(self, format_string, *args):
         log(f"HTTP {self.address_string()} {format_string % args}")
@@ -413,9 +415,8 @@ class Handler(BaseHTTPRequestHandler):
             event = json.loads(payload)
             if not isinstance(event, dict):
                 raise ValueError("Stripe event must be an object")
-            # A production endpoint must never treat synthetic / test-mode events as revenue.
-            if event.get("livemode") is not True:
-                self._json(200, {"received": True, "ignored": True, "reason": "non_live_event"})
+            if event.get("livemode") is not self.expected_livemode:
+                self._json(200, {"received": True, "ignored": True, "reason": self.wrong_mode_reason})
                 return
             inserted, payment = record_event(event, payload)
         except (json.JSONDecodeError, ValueError) as exc:
