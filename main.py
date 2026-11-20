@@ -14,6 +14,7 @@ from urllib.request import Request, urlopen
 
 PORT = int(os.environ.get("PORT", "8080"))
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+METRICS_READ_TOKEN = os.environ.get("METRICS_READ_TOKEN", "")
 ALLOW_UNVERIFIED_WEBHOOKS = os.environ.get("ALLOW_UNVERIFIED_WEBHOOKS", "false").lower() == "true"
 GARCAR_ENVIRONMENT = os.environ.get("GARCAR_ENVIRONMENT", "production").strip().lower()
 SERVER_HOST = os.environ.get("HOST", "0.0.0.0").strip()
@@ -88,6 +89,13 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_payments_created_at ON payments(created_at);
             """
         )
+        # Older versions could leave an unidentified offer pending for dispatch.
+        connection.create_function("receipt_needs_review", 4, stored_receipt_needs_review)
+        connection.execute("""
+            UPDATE payments SET status = 'PAID_MANUAL_REVIEW'
+            WHERE status = 'PAID_PENDING_FULFILLMENT'
+              AND receipt_needs_review(metadata_json, sku, amount_minor, currency)
+        """)
 
 
 def verify_stripe_signature(payload: bytes, signature_header: str, secret: str, now: int | None = None) -> bool:
@@ -117,6 +125,14 @@ def verify_stripe_signature(payload: bytes, signature_header: str, secret: str, 
     return any(hmac.compare_digest(expected, candidate) for candidate in signatures)
 
 
+def metrics_authorized(authorization: str) -> bool:
+    """Compare the complete metrics bearer token without exposing its value."""
+    if (not METRICS_READ_TOKEN.isascii() or not METRICS_READ_TOKEN
+            or not authorization.isascii() or not authorization.startswith("Bearer ")):
+        return False
+    return hmac.compare_digest(authorization[7:], METRICS_READ_TOKEN)
+
+
 def _safe_int(value, default: int = 0) -> int:
     try:
         return int(value)
@@ -129,9 +145,28 @@ def _metadata(obj: dict) -> dict:
     return raw if isinstance(raw, dict) else {}
 
 
+def explicit_sku(metadata: dict) -> str:
+    raw_sku = metadata.get("sku") or metadata.get("offer_id")
+    return raw_sku.strip() if isinstance(raw_sku, str) else ""
+
+
+def offer_needs_review(sku: str, amount_minor: int, currency: str) -> bool:
+    return (not sku or sku.startswith("manual-review-") or sku == "metadata-offer"
+            or (sku == "MLS-497" and (amount_minor != 49700 or currency != "usd")))
+
+
+def stored_receipt_needs_review(metadata_json: str, sku: str, amount_minor: int, currency: str) -> bool:
+    try:
+        metadata = json.loads(metadata_json)
+    except (ValueError, TypeError):
+        return True
+    return (not isinstance(metadata, dict) or explicit_sku(metadata) != sku
+            or offer_needs_review(sku, amount_minor, currency))
+
+
 def resolve_offer(obj: dict, amount_minor: int) -> dict:
     metadata = _metadata(obj)
-    sku = str(metadata.get("sku") or metadata.get("offer_id") or "").strip()
+    sku = explicit_sku(metadata)
     name = str(metadata.get("offer_name") or metadata.get("product_name") or "").strip()
     hours = _safe_int(metadata.get("fulfill_hours"), 0)
     if sku or name:
@@ -177,6 +212,8 @@ def extract_payment(event: dict) -> dict | None:
     if amount_minor <= 0:
         return None
     offer = resolve_offer(obj, amount_minor)
+    sku = offer["sku"]
+    hold = offer_needs_review(sku, amount_minor, obj.get("currency"))
     payment_reference = payment_intent or f"{event.get('id')}-{amount_minor}"
     return {
         "payment_reference": payment_reference,
@@ -190,7 +227,7 @@ def extract_payment(event: dict) -> dict | None:
         "fulfill_hours": offer["fulfill_hours"],
         "session_id": str(obj.get("id") or ""),
         "recurring": 1 if recurring else 0,
-        "status": "PAID_PENDING_FULFILLMENT",
+        "status": "PAID_MANUAL_REVIEW" if hold else "PAID_PENDING_FULFILLMENT",
         "created_at": utc_now(),
         "metadata_json": json.dumps(_metadata(obj), sort_keys=True),
     }
@@ -266,6 +303,7 @@ def fulfillment_summary() -> dict:
     counts = {row["status"]: row["count"] for row in rows}
     return {
         "paid_pending_fulfillment": counts.get("PAID_PENDING_FULFILLMENT", 0),
+        "paid_manual_review": counts.get("PAID_MANUAL_REVIEW", 0),
         "fulfillment_attempting": counts.get("FULFILLMENT_ATTEMPTING", 0),
         "fulfillment_outcome_unknown": counts.get("FULFILLMENT_OUTCOME_UNKNOWN", 0),
         "fulfillment_notified": counts.get("FULFILLMENT_NOTIFIED", 0),
@@ -275,7 +313,16 @@ def fulfillment_summary() -> dict:
 
 
 def notify_fulfillment(payment: dict) -> bool:
+    # An untagged or name-only payment must never trigger an external handoff.
+    if payment.get("status") != "PAID_PENDING_FULFILLMENT":
+        return False
     if not FULFILLMENT_WEBHOOK_URL:
+        return False
+    # Never send buyer identity, payment references or order details without
+    # authenticating the downstream receiver. If credentials are missing,
+    # preserve the pending row for an explicitly authorized later retry.
+    if not FULFILLMENT_WEBHOOK_TOKEN:
+        log("Fulfillment withheld: downstream bearer token not configured")
         return False
     try:
         target = urlparse(FULFILLMENT_WEBHOOK_URL)
@@ -363,12 +410,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        if path in ("/revenue", "/mrr", "/fulfillment-status"):
+            if not METRICS_READ_TOKEN:
+                self._json(503, {"error": "private metrics not configured"})
+                return
+            if not metrics_authorized(self.headers.get("Authorization", "")):
+                self._json(403, {"error": "forbidden"})
+                return
         if path == "/health":
             self._json(200, {
                 "alive": True,
                 "webhook_signature_configured": bool(STRIPE_WEBHOOK_SECRET),
                 "unsigned_local_test_enabled": bool(UNSIGNED_LOCAL_TEST),
-                "fulfillment_configured": bool(FULFILLMENT_WEBHOOK_URL),
+                "fulfillment_configured": bool(FULFILLMENT_WEBHOOK_URL and FULFILLMENT_WEBHOOK_TOKEN),
                 "ready_for_live_webhooks": bool(STRIPE_WEBHOOK_SECRET),
             })
         elif path == "/ready":
@@ -442,6 +496,9 @@ class Handler(BaseHTTPRequestHandler):
                 log(f"Duplicate-event payment state lookup failed: {type(exc).__name__}")
                 self._json(500, {"error": "database unavailable", "duplicate": True})
                 return
+            if prior and prior["status"] == "PAID_MANUAL_REVIEW":
+                self._json(200, {"received": True, "duplicate": True, "manual_review_required": True})
+                return
             if prior and prior["status"] in (
                     "FULFILLMENT_ATTEMPTING", "FULFILLMENT_OUTCOME_UNKNOWN"):
                 self._json(200, {
@@ -476,7 +533,8 @@ class Handler(BaseHTTPRequestHandler):
         notified = notify_fulfillment(payment) if payment else False
         if payment:
             log(f"PAYMENT QUEUED reference={payment['payment_reference']} sku={payment['sku']} amount_minor={payment['amount_minor']}")
-            if FULFILLMENT_WEBHOOK_URL and not notified:
+            if (FULFILLMENT_WEBHOOK_URL and payment["status"] == "PAID_PENDING_FULFILLMENT"
+                    and not notified):
                 # Return non-2xx so Stripe retries; payment row already persisted.
                 self._json(502, {
                     "received": True,
@@ -488,6 +546,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {
             "received": True,
             "payment_queued": bool(payment),
+            "manual_review_required": bool(payment and payment["status"] == "PAID_MANUAL_REVIEW"),
             "fulfillment_notified": notified,
         })
 

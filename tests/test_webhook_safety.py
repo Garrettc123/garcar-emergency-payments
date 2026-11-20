@@ -48,7 +48,7 @@ class ReceiverSafetyTests(unittest.TestCase):
             patch.object(main, "UNSIGNED_LOCAL_TEST", False),
             patch.object(main, "FULFILLMENT_WEBHOOK_URL",
                          "https://example.net/fulfillment"),
-            patch.object(main, "FULFILLMENT_WEBHOOK_TOKEN", ""),
+            patch.object(main, "FULFILLMENT_WEBHOOK_TOKEN", "fixture-auth-only-token"),
         ]
         for p in self.patchers:
             p.start()
