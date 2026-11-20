@@ -89,6 +89,13 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_payments_created_at ON payments(created_at);
             """
         )
+        # Older versions could leave an unidentified offer pending for dispatch.
+        connection.create_function("receipt_needs_review", 4, stored_receipt_needs_review)
+        connection.execute("""
+            UPDATE payments SET status = 'PAID_MANUAL_REVIEW'
+            WHERE status = 'PAID_PENDING_FULFILLMENT'
+              AND receipt_needs_review(metadata_json, sku, amount_minor, currency)
+        """)
 
 
 def verify_stripe_signature(payload: bytes, signature_header: str, secret: str, now: int | None = None) -> bool:
@@ -120,7 +127,8 @@ def verify_stripe_signature(payload: bytes, signature_header: str, secret: str, 
 
 def metrics_authorized(authorization: str) -> bool:
     """Compare the complete metrics bearer token without exposing its value."""
-    if not METRICS_READ_TOKEN or not authorization.startswith("Bearer "):
+    if (not METRICS_READ_TOKEN.isascii() or not METRICS_READ_TOKEN
+            or not authorization.isascii() or not authorization.startswith("Bearer ")):
         return False
     return hmac.compare_digest(authorization[7:], METRICS_READ_TOKEN)
 
@@ -137,9 +145,28 @@ def _metadata(obj: dict) -> dict:
     return raw if isinstance(raw, dict) else {}
 
 
+def explicit_sku(metadata: dict) -> str:
+    raw_sku = metadata.get("sku") or metadata.get("offer_id")
+    return raw_sku.strip() if isinstance(raw_sku, str) else ""
+
+
+def offer_needs_review(sku: str, amount_minor: int, currency: str) -> bool:
+    return (not sku or sku.startswith("manual-review-") or sku == "metadata-offer"
+            or (sku == "MLS-497" and (amount_minor != 49700 or currency != "usd")))
+
+
+def stored_receipt_needs_review(metadata_json: str, sku: str, amount_minor: int, currency: str) -> bool:
+    try:
+        metadata = json.loads(metadata_json)
+    except (ValueError, TypeError):
+        return True
+    return (not isinstance(metadata, dict) or explicit_sku(metadata) != sku
+            or offer_needs_review(sku, amount_minor, currency))
+
+
 def resolve_offer(obj: dict, amount_minor: int) -> dict:
     metadata = _metadata(obj)
-    sku = str(metadata.get("sku") or metadata.get("offer_id") or "").strip()
+    sku = explicit_sku(metadata)
     name = str(metadata.get("offer_name") or metadata.get("product_name") or "").strip()
     hours = _safe_int(metadata.get("fulfill_hours"), 0)
     if sku or name:
@@ -185,6 +212,8 @@ def extract_payment(event: dict) -> dict | None:
     if amount_minor <= 0:
         return None
     offer = resolve_offer(obj, amount_minor)
+    sku = offer["sku"]
+    hold = offer_needs_review(sku, amount_minor, obj.get("currency"))
     payment_reference = payment_intent or f"{event.get('id')}-{amount_minor}"
     return {
         "payment_reference": payment_reference,
@@ -198,8 +227,7 @@ def extract_payment(event: dict) -> dict | None:
         "fulfill_hours": offer["fulfill_hours"],
         "session_id": str(obj.get("id") or ""),
         "recurring": 1 if recurring else 0,
-        "status": ("PAID_MANUAL_REVIEW" if offer["sku"].startswith("manual-review-")
-                   or offer["sku"] == "metadata-offer" else "PAID_PENDING_FULFILLMENT"),
+        "status": "PAID_MANUAL_REVIEW" if hold else "PAID_PENDING_FULFILLMENT",
         "created_at": utc_now(),
         "metadata_json": json.dumps(_metadata(obj), sort_keys=True),
     }
@@ -394,7 +422,7 @@ class Handler(BaseHTTPRequestHandler):
                 "alive": True,
                 "webhook_signature_configured": bool(STRIPE_WEBHOOK_SECRET),
                 "unsigned_local_test_enabled": bool(UNSIGNED_LOCAL_TEST),
-                "fulfillment_configured": bool(FULFILLMENT_WEBHOOK_URL),
+                "fulfillment_configured": bool(FULFILLMENT_WEBHOOK_URL and FULFILLMENT_WEBHOOK_TOKEN),
                 "ready_for_live_webhooks": bool(STRIPE_WEBHOOK_SECRET),
             })
         elif path == "/ready":
@@ -467,6 +495,9 @@ class Handler(BaseHTTPRequestHandler):
             except sqlite3.Error as exc:
                 log(f"Duplicate-event payment state lookup failed: {type(exc).__name__}")
                 self._json(500, {"error": "database unavailable", "duplicate": True})
+                return
+            if prior and prior["status"] == "PAID_MANUAL_REVIEW":
+                self._json(200, {"received": True, "duplicate": True, "manual_review_required": True})
                 return
             if prior and prior["status"] in (
                     "FULFILLMENT_ATTEMPTING", "FULFILLMENT_OUTCOME_UNKNOWN"):

@@ -101,11 +101,48 @@ class PaymentReceiverTests(unittest.TestCase):
         event["data"]["object"]["metadata"] = {"offer_name": "ambiguous"}
         self.assertEqual(main.extract_payment(event)["status"], "PAID_MANUAL_REVIEW")
 
+    def test_review_price_and_currency_must_match_offer(self):
+        for amount, currency, expected in (
+            (49700, "usd", "PAID_PENDING_FULFILLMENT"),
+            (4700, "usd", "PAID_MANUAL_REVIEW"),
+            (49700, "eur", "PAID_MANUAL_REVIEW"),
+            (49700, None, "PAID_MANUAL_REVIEW"),
+        ):
+            with self.subTest(amount=amount, currency=currency):
+                event = self.checkout_event()
+                event["data"]["object"].update(metadata={"sku": "MLS-497"},
+                                                amount_total=amount, currency=currency)
+                self.assertEqual(main.extract_payment(event)["status"], expected)
+
+    def test_upgrade_reclassifies_only_unattempted_unattributed_receipts(self):
+        cases = [
+            ("unattributed", {}, "manual-review-497", "PAID_PENDING_FULFILLMENT", "PAID_MANUAL_REVIEW"),
+            ("old-guess", {}, "guessed-sku", "PAID_PENDING_FULFILLMENT", "PAID_MANUAL_REVIEW"),
+            ("approved", {"offer_id": "MLS-497"}, "MLS-497", "PAID_PENDING_FULFILLMENT", "PAID_PENDING_FULFILLMENT"),
+            ("in-flight", {}, "manual-review-497", "FULFILLMENT_ATTEMPTING", "FULFILLMENT_ATTEMPTING"),
+            ("unknown", {}, "manual-review-497", "FULFILLMENT_OUTCOME_UNKNOWN", "FULFILLMENT_OUTCOME_UNKNOWN"),
+            ("notified", {}, "manual-review-497", "FULFILLMENT_NOTIFIED", "FULFILLMENT_NOTIFIED"),
+        ]
+        for ref, metadata, old_sku, old_status, _ in cases:
+            event = self.checkout_event("event-" + ref)
+            event["data"]["object"].update(payment_intent=ref, amount_total=49700, metadata=metadata)
+            main.record_event(event, json.dumps(event).encode())
+            with main._connect() as db:
+                db.execute("UPDATE payments SET status=?, sku=? WHERE payment_reference=?",
+                           (old_status, old_sku, ref))
+        main.init_db()
+        main.init_db()
+        with main._connect() as db:
+            statuses = dict(db.execute("SELECT payment_reference, status FROM payments"))
+        self.assertEqual(statuses, {ref: expected for ref, _, _, _, expected in cases})
+        self.assertFalse(main.reserve_fulfillment_attempt("old-guess"))
+
     def test_private_metrics_bearer_check(self):
         with patch.object(main, "METRICS_READ_TOKEN", "long-read-only-metrics-token"):
             self.assertFalse(main.metrics_authorized(""))
             self.assertFalse(main.metrics_authorized("Bearer incorrect"))
             self.assertFalse(main.metrics_authorized("Basic long-read-only-metrics-token"))
+            self.assertFalse(main.metrics_authorized("Bearer café"))
             self.assertTrue(main.metrics_authorized("Bearer long-read-only-metrics-token"))
         with patch.object(main, "METRICS_READ_TOKEN", ""):
             self.assertFalse(main.metrics_authorized("Bearer long-read-only-metrics-token"))
@@ -116,13 +153,14 @@ class PaymentReceiverTests(unittest.TestCase):
             "sku": "approved-contract-review",
             "offer_name": "Approved Contract Review",
         }
-        payment = main.extract_payment(event)
+        _, payment = main.record_event(event, json.dumps(event).encode())
         self.assertEqual(payment["status"], "PAID_PENDING_FULFILLMENT")
         with patch.object(main, "FULFILLMENT_WEBHOOK_URL", "https://internal.example/fulfill"):
             with patch.object(main, "FULFILLMENT_WEBHOOK_TOKEN", ""):
                 with patch.object(main, "urlopen", side_effect=AssertionError("must not send")):
                     self.assertFalse(main.notify_fulfillment(payment))
         self.assertEqual(main.fulfillment_summary()["fulfillment_attempting"], 0)
+        self.assertEqual(main.fulfillment_summary()["paid_pending_fulfillment"], 1)
 
     def test_private_metrics_http_routes_fail_closed(self):
         class Capture:
