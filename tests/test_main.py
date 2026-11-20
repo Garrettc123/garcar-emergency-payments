@@ -4,6 +4,7 @@ import json
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import main
@@ -81,6 +82,159 @@ class PaymentReceiverTests(unittest.TestCase):
         event = self.checkout_event("evt_unpaid")
         event["data"]["object"]["payment_status"] = "unpaid"
         self.assertIsNone(main.extract_payment(event))
+
+    def test_pre_upgrade_event_starts_at_one_known_delivery(self):
+        with main._connect() as db:
+            db.execute("ALTER TABLE stripe_events DROP COLUMN matching_deliveries")
+            stored = ("fixture-existing-event", "checkout.session.completed", main.utc_now(), "existing-digest")
+            db.execute("INSERT INTO stripe_events VALUES (?, ?, ?, ?)", stored)
+        main.init_db()
+        main.init_db()
+        with main._connect() as db:
+            row = db.execute("SELECT event_id, payload_sha256, matching_deliveries FROM stripe_events").fetchone()
+        self.assertEqual(tuple(row), (stored[0], stored[3], 1))
+
+    def test_unattributed_payment_is_held_without_handoff(self):
+        event = self.checkout_event("evt_held_497")
+        event["data"]["object"]["amount_total"] = 49700
+        event["data"]["object"]["payment_intent"] = "pi_held_497"
+        payment = main.extract_payment(event)
+        self.assertEqual(payment["status"], "PAID_MANUAL_REVIEW")
+        with patch.object(main, "FULFILLMENT_WEBHOOK_URL", "https://internal.example/fulfill"):
+            with patch.object(main, "urlopen", side_effect=AssertionError("must not call")):
+                self.assertFalse(main.notify_fulfillment(payment))
+        inserted, _ = main.record_event(event, json.dumps(event).encode())
+        self.assertTrue(inserted)
+        self.assertEqual(main.fulfillment_summary()["paid_manual_review"], 1)
+
+    def test_name_only_offer_is_held(self):
+        event = self.checkout_event("evt_name_only")
+        event["data"]["object"]["metadata"] = {"offer_name": "ambiguous"}
+        self.assertEqual(main.extract_payment(event)["status"], "PAID_MANUAL_REVIEW")
+
+    def test_review_price_and_currency_must_match_offer(self):
+        for amount, currency, expected in (
+            (49700, "usd", "PAID_PENDING_FULFILLMENT"),
+            (4700, "usd", "PAID_MANUAL_REVIEW"),
+            (49700, "eur", "PAID_MANUAL_REVIEW"),
+            (49700, None, "PAID_MANUAL_REVIEW"),
+        ):
+            with self.subTest(amount=amount, currency=currency):
+                event = self.checkout_event()
+                event["data"]["object"].update(metadata={"sku": "MLS-497"},
+                                                amount_total=amount, currency=currency)
+                self.assertEqual(main.extract_payment(event)["status"], expected)
+
+    def test_upgrade_reclassifies_only_unattempted_unattributed_receipts(self):
+        cases = [
+            ("unattributed", {}, "manual-review-497", "PAID_PENDING_FULFILLMENT", "PAID_MANUAL_REVIEW"),
+            ("old-guess", {}, "guessed-sku", "PAID_PENDING_FULFILLMENT", "PAID_MANUAL_REVIEW"),
+            ("approved", {"offer_id": "MLS-497"}, "MLS-497", "PAID_PENDING_FULFILLMENT", "PAID_PENDING_FULFILLMENT"),
+            ("in-flight", {}, "manual-review-497", "FULFILLMENT_ATTEMPTING", "FULFILLMENT_ATTEMPTING"),
+            ("unknown", {}, "manual-review-497", "FULFILLMENT_OUTCOME_UNKNOWN", "FULFILLMENT_OUTCOME_UNKNOWN"),
+            ("notified", {}, "manual-review-497", "FULFILLMENT_NOTIFIED", "FULFILLMENT_NOTIFIED"),
+        ]
+        for ref, metadata, old_sku, old_status, _ in cases:
+            event = self.checkout_event("event-" + ref)
+            event["data"]["object"].update(payment_intent=ref, amount_total=49700, metadata=metadata)
+            main.record_event(event, json.dumps(event).encode())
+            with main._connect() as db:
+                db.execute("UPDATE payments SET status=?, sku=? WHERE payment_reference=?",
+                           (old_status, old_sku, ref))
+        main.init_db()
+        main.init_db()
+        with main._connect() as db:
+            statuses = dict(db.execute("SELECT payment_reference, status FROM payments"))
+        self.assertEqual(statuses, {ref: expected for ref, _, _, _, expected in cases})
+        self.assertFalse(main.reserve_fulfillment_attempt("old-guess"))
+
+    def test_private_metrics_bearer_check(self):
+        with patch.object(main, "METRICS_READ_TOKEN", "long-read-only-metrics-token"):
+            self.assertFalse(main.metrics_authorized(""))
+            self.assertFalse(main.metrics_authorized("Bearer incorrect"))
+            self.assertFalse(main.metrics_authorized("Basic long-read-only-metrics-token"))
+            self.assertFalse(main.metrics_authorized("Bearer café"))
+            self.assertTrue(main.metrics_authorized("Bearer long-read-only-metrics-token"))
+        with patch.object(main, "METRICS_READ_TOKEN", ""):
+            self.assertFalse(main.metrics_authorized("Bearer long-read-only-metrics-token"))
+
+    def test_downstream_handoff_requires_bearer_token(self):
+        event = self.checkout_event("evt_withheld_no_token")
+        event["data"]["object"]["metadata"] = {
+            "sku": "approved-contract-review",
+            "offer_name": "Approved Contract Review",
+        }
+        _, payment = main.record_event(event, json.dumps(event).encode())
+        self.assertEqual(payment["status"], "PAID_PENDING_FULFILLMENT")
+        with patch.object(main, "FULFILLMENT_WEBHOOK_URL", "https://internal.example/fulfill"):
+            with patch.object(main, "FULFILLMENT_WEBHOOK_TOKEN", ""):
+                with patch.object(main, "urlopen", side_effect=AssertionError("must not send")):
+                    self.assertFalse(main.notify_fulfillment(payment))
+        self.assertEqual(main.fulfillment_summary()["fulfillment_attempting"], 0)
+        self.assertEqual(main.fulfillment_summary()["paid_pending_fulfillment"], 1)
+
+    def test_private_metrics_http_routes_fail_closed(self):
+        class Capture:
+            def __init__(self, path, auth):
+                self.path = path
+                self.headers = {"Authorization": auth}
+                self.responses = []
+
+            def _json(self, status, body):
+                self.responses.append((status, body))
+
+        for path in ("/revenue", "/mrr", "/fulfillment-status"):
+            with self.subTest(path=path):
+                with patch.object(main, "METRICS_READ_TOKEN", ""):
+                    handler = Capture(path, "")
+                    main.Handler.do_GET(handler)
+                    self.assertEqual(handler.responses[0][0], 503)
+                with patch.object(main, "METRICS_READ_TOKEN", "protected-token"):
+                    handler = Capture(path, "Bearer wrong")
+                    main.Handler.do_GET(handler)
+                    self.assertEqual(handler.responses[0][0], 403)
+                    handler = Capture(path, "Bearer protected-token")
+                    main.Handler.do_GET(handler)
+                    self.assertEqual(handler.responses[0][0], 200)
+
+    def test_signed_unattributed_webhook_acknowledges_manual_hold(self):
+        from io import BytesIO
+        event = self.checkout_event("evt_signed_manual_hold")
+        event["livemode"] = True
+        event["data"]["object"]["amount_total"] = 49700
+        event["data"]["object"]["payment_intent"] = "pi_signed_manual_hold"
+        payload = json.dumps(event).encode()
+        timestamp = int(time.time())
+        signature = hmac.new(
+            b"whsec_local_fixture",
+            f"{timestamp}.".encode() + payload,
+            hashlib.sha256,
+        ).hexdigest()
+
+        class Capture(main.Handler):
+            path = "/stripe-webhook"
+            headers = {
+                "Content-Length": str(len(payload)),
+                "Stripe-Signature": f"t={timestamp},v1={signature}",
+            }
+            rfile = BytesIO(payload)
+
+            def __init__(self):
+                self.responses = []
+
+            def _json(self, status, body):
+                self.responses.append((status, body))
+
+        with patch.object(main, "STRIPE_WEBHOOK_SECRET", "whsec_local_fixture"):
+            with patch.object(main, "FULFILLMENT_WEBHOOK_URL", "https://internal.example/fulfill"):
+                with patch.object(main, "urlopen", side_effect=AssertionError("must not call")):
+                    handler = Capture()
+                    main.Handler.do_POST(handler)
+        status, body = handler.responses[0]
+        self.assertEqual(status, 200)
+        self.assertTrue(body["manual_review_required"])
+        self.assertFalse(body["fulfillment_notified"])
+        self.assertEqual(main.fulfillment_summary()["paid_manual_review"], 1)
 
 
 if __name__ == "__main__":

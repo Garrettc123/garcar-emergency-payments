@@ -90,7 +90,10 @@ class SandboxCheckoutTests(unittest.TestCase):
             with listener(directory, secret) as root:
                 self.assertEqual(deliver(root, event, secret), (200, {
                     "received": True, "payment_queued": True, "fulfillment_notified": False,
+                    "manual_review_required": False,
                 }))
+                with self.assertRaisesRegex(ValueError, "second delivery"):
+                    sandbox_receiver.verify_receipt(directory, event["data"]["object"], require_redelivery=True)
 
             with listener(directory, secret) as root:
                 status, replay = deliver(root, event, secret)
@@ -114,10 +117,13 @@ class SandboxCheckoutTests(unittest.TestCase):
                 self.assertEqual(events, [(event["id"], hashlib.sha256(raw).hexdigest())])
             session = event["data"]["object"]
             proof = subprocess.run(
-                [sys.executable, str(SCRIPT), "--data-dir", str(directory), "--verify-session"],
+                [sys.executable, str(SCRIPT), "--data-dir", str(directory), "--verify-session",
+                 "--require-redelivery"],
                 input=json.dumps(session), capture_output=True, text=True, check=True,
             )
-            self.assertEqual(json.loads(proof.stdout)["event_id"], event["id"])
+            result = json.loads(proof.stdout)
+            self.assertEqual(result["event_id"], event["id"])
+            self.assertEqual(result["matching_deliveries"], 2)
             with self.assertRaisesRegex(ValueError, "exactly one"):
                 sandbox_receiver.verify_receipt(directory, {**session, "payment_intent": "other"})
             with self.assertRaisesRegex(ValueError, "sandbox Checkout Session"):

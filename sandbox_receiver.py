@@ -39,7 +39,7 @@ def sandbox_database(directory: Path) -> Path:
     return path
 
 
-def verify_receipt(directory: Path, session: dict) -> dict:
+def verify_receipt(directory: Path, session: dict, *, require_redelivery: bool = False) -> dict:
     if not isinstance(session, dict):
         raise ValueError("Expected a Stripe Checkout Session object")
     session_id = session.get("id")
@@ -59,15 +59,18 @@ def verify_receipt(directory: Path, session: dict) -> dict:
             raise ValueError("Expected a Garcar sandbox ledger")
         rows = db.execute("""
             SELECT p.payment_reference, p.sku, p.amount_minor, p.currency,
-                   e.event_id, e.payload_sha256
+                   e.event_id, e.payload_sha256, e.matching_deliveries
             FROM payments p JOIN stripe_events e ON e.event_id = p.event_id
             WHERE p.session_id = ?
         """, (session_id,)).fetchall()
     if len(rows) != 1 or rows[0][:4] != (intent, "MLS-497", 49700, "usd"):
         raise ValueError("Expected exactly one matching receipt for the supplied session")
+    deliveries = rows[0][6]
+    if require_redelivery and deliveries < 2:
+        raise ValueError("A second delivery of the original signed event payload has not been recorded")
     return {"matching_receipts": 1, "session_id": session_id, "payment_intent": intent,
             "sku": "MLS-497", "amount_minor": 49700, "currency": "usd",
-            "event_id": rows[0][4], "payload_sha256": rows[0][5]}
+            "event_id": rows[0][4], "payload_sha256": rows[0][5], "matching_deliveries": deliveries}
 
 
 def run():
@@ -76,10 +79,14 @@ def run():
     parser.add_argument("--port", type=int, default=4242)
     parser.add_argument("--verify-session", action="store_true",
                         help="compare Stripe Checkout Session JSON from stdin to the sandbox ledger")
+    parser.add_argument("--require-redelivery", action="store_true",
+                        help="also require the original event payload to have arrived at least twice")
     args = parser.parse_args()
+    if args.require_redelivery and not args.verify_session:
+        parser.error("--require-redelivery requires --verify-session")
     if args.verify_session:
         try:
-            receipt = verify_receipt(args.data_dir, json.load(sys.stdin))
+            receipt = verify_receipt(args.data_dir, json.load(sys.stdin), require_redelivery=args.require_redelivery)
         except (sqlite3.Error, ValueError) as error:
             parser.exit(1, f"Receipt verification failed: {error}\n")
         print(json.dumps(receipt))

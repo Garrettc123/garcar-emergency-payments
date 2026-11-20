@@ -74,7 +74,11 @@ stripe checkout sessions retrieve "$SESSION_ID" |
   python sandbox_receiver.py --data-dir "$HOME/.local/share/garcar/stripe-sandbox" --verify-session
 ```
 
-A successful comparison prints the session, PaymentIntent, Stripe event ID, payload digest and a receipt count of one. It checks the amount, currency and SKU against the locally persisted receipt. Restart the receiver using the same directory to check persistence. For a Stripe-initiated redelivery, use **Resend** on the original event at a registered, isolated **sandbox** event destination routed to this receiver, then repeat the comparison. The local test suite separately exercises a signed fixture twice across a process restart.
+A successful comparison prints the session, PaymentIntent, event ID, payload digest, matching delivery count and receipt count. It checks the amount, currency and SKU against the stored receipt.
+
+Restart the sandbox receiver using the same directory. To exercise a Stripe-initiated retry, use **Resend** on the original event at a registered sandbox event destination routed to this receiver. Repeat the comparison with `--verify-session --require-redelivery`. It succeeds only when the ledger contains one matching receipt and at least two deliveries with the same event ID and payload digest. Existing ledger events start at one known delivery when this counter is introduced.
+
+The local test suite exercises this check with a signed fixture and a process restart. A provider acceptance run also requires a Checkout Session and delivery history from the selected Stripe sandbox.
 
 The sandbox entry point uses a dedicated SQLite file, binds to loopback and disables fulfillment. Its local receipt count is excluded from the production ledger.
 
@@ -157,6 +161,7 @@ Do not send paid traffic until all of these pass:
 4. Redelivery of the same event returns `duplicate: true`; the original session still reconciles to one receipt.
 5. Each live Payment Link contains a distinct `sku` metadata value.
 6. The fulfillment notification reaches a monitored system.
+7. Authorized metrics clients have the configured `METRICS_READ_TOKEN`, and the downstream fulfillment receiver verifies its own bearer token.
 
 ## Founder
 
