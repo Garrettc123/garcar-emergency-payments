@@ -53,13 +53,34 @@ python main.py
 python -m unittest discover -s tests -v
 ```
 
-Then test the full Stripe path:
+### Reconcile a $497 sandbox checkout
+
+Run `stripe listen` with the Garcar sandbox selected in the Stripe CLI. Forward only completed Checkout Sessions to the separate loopback receiver.
 
 ```bash
-stripe listen --forward-to localhost:8080/stripe-webhook
-# Copy the whsec value printed by Stripe CLI into STRIPE_WEBHOOK_SECRET.
-stripe trigger checkout.session.completed
+stripe listen --events checkout.session.completed --forward-to http://127.0.0.1:4242/stripe-webhook
 ```
+
+In a second terminal, set `STRIPE_SANDBOX_WEBHOOK_SECRET` privately to that listener's signing secret, then run:
+
+```bash
+python sandbox_receiver.py --data-dir "$HOME/.local/share/garcar/stripe-sandbox"
+```
+
+Use the Garcar sandbox to create a one-time Checkout Session for USD 497.00 with session metadata `sku=MLS-497`. Complete its hosted checkout with a Stripe test payment method. In the sandbox's **Workbench → Events**, open the corresponding `checkout.session.completed` event and copy its Checkout Session ID. Set `SESSION_ID` to that value in your shell.
+
+```bash
+stripe checkout sessions retrieve "$SESSION_ID" |
+  python sandbox_receiver.py --data-dir "$HOME/.local/share/garcar/stripe-sandbox" --verify-session
+```
+
+A successful comparison prints the session, PaymentIntent, event ID, payload digest, matching delivery count and receipt count. It checks the amount, currency and SKU against the stored receipt.
+
+Restart the sandbox receiver using the same directory. To exercise a Stripe-initiated retry, use **Resend** on the original event at a registered sandbox event destination routed to this receiver. Repeat the comparison with `--verify-session --require-redelivery`. It succeeds only when the ledger contains one matching receipt and at least two deliveries with the same event ID and payload digest. Existing ledger events start at one known delivery when this counter is introduced.
+
+The local test suite exercises this check with a signed fixture and a process restart. A provider acceptance run also requires a Checkout Session and delivery history from the selected Stripe sandbox.
+
+The sandbox entry point uses a dedicated SQLite file, binds to loopback and disables fulfillment. Its local receipt count is excluded from the production ledger.
 
 ## Stripe configuration
 
@@ -136,10 +157,11 @@ Do not send paid traffic until all of these pass:
 
 1. Persistent storage is mounted and survives a restart.
 2. `STRIPE_WEBHOOK_SECRET` is configured.
-3. A Stripe CLI test event returns HTTP 200.
-4. Replaying the same event returns `duplicate: true` and does not increase totals.
+3. A paid Stripe sandbox checkout reconciles to one receipt in the sandbox ledger.
+4. Redelivery of the same event returns `duplicate: true`; the original session still reconciles to one receipt.
 5. Each live Payment Link contains a distinct `sku` metadata value.
 6. The fulfillment notification reaches a monitored system.
+7. Authorized metrics clients have the configured `METRICS_READ_TOKEN`, and the downstream fulfillment receiver verifies its own bearer token.
 
 ## Founder
 
